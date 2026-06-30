@@ -1,9 +1,0 @@
-services:
-  caddy:
-    image: ghcr.io/scottdkey/caddy:latest
-    container_name: caddy
-    restart: unless-stopped
-    ports:
-      - "80:80"
-    volumes:
-      - /opt/caddy/config:/config
