@@ -2,6 +2,10 @@
 name = "caddy"
 version = "0.1.0"
 edition = "2021"
+description = "Caddy reverse proxy — orca service-backend"
+
+[package.metadata.orca]
+category = "networking"
 
 [lib]
 name = "caddy"
