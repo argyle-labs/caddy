@@ -14,7 +14,7 @@ This repo is **self-contained** — the steps below run caddy **by hand, without
 
 ## Run it without orca
 
-### Docker / Podman
+### Docker Compose
 
 ```yaml
 # compose.yml
@@ -37,7 +37,26 @@ services:
 docker compose up -d
 ```
 
-Podman: the same file with `podman-compose up -d`.
+### Other runtimes
+
+**Podman** — the compose above works with `podman compose up -d`, or run it directly:
+
+```sh
+podman run -d --name caddy --restart unless-stopped \
+    -p 80:80/tcp \
+    -p 443:443/tcp \
+    -p 443:443/udp \
+    -v ./Caddyfile:/etc/caddy/Caddyfile \
+    -v ./data:/data \
+    -v ./config:/config \
+    caddy:latest
+```
+
+**LXC** — on a container-capable LXC (e.g. a Proxmox LXC with nesting enabled) run the same image via Docker/Podman as above, or install caddy from upstream directly on the guest: <https://caddyserver.com/>.
+
+**VM** — install caddy from upstream (<https://caddyserver.com/>) or run the same container image inside the VM; expose port `80`.
+
+**Unraid** — add via *Community Applications*, or *Docker → Add Container* with image `caddy:latest`, port `80`, and the volume paths above.
 
 ### Ports & data
 
