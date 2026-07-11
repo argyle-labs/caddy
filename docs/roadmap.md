@@ -18,6 +18,7 @@ not just deploy it:
   (`CF_API_TOKEN`) and cert status.
 - **Validate** (`caddy validate`) before applying.
 
-Reference implementation to model against: the live instance config lives in the
-private meerkat repo (`config/caddy/Caddyfile`) — the route table there is the
-concrete shape this plugin should be able to generate and manage.
+A route is the concrete shape this plugin should be able to generate and manage:
+a hostname mapped to an upstream `host:port`, with optional TLS-backend
+(self-signed skip-verify) and header rewrites. See
+[`examples/Caddyfile.example`](../examples/Caddyfile.example) for the pattern.
