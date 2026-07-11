@@ -1,0 +1,30 @@
+# Caddy reverse proxy — self-built image (Cloudflare DNS module, see Dockerfile).
+# docs: docs/caddy.md
+#
+# CF_API_TOKEN drives DNS-01 ACME (wildcard certs). Provide it via the environment
+# (e.g. .env or the orca secret store) — never commit the token.
+# Provide your own ./Caddyfile; see examples/Caddyfile.example for the pattern.
+services:
+  caddy:
+    build: .
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      - CF_API_TOKEN=${CF_API_TOKEN}
+    healthcheck:
+      test: ["CMD", "caddy", "version"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  caddy_data:
+  caddy_config:

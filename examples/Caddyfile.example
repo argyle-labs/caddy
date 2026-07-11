@@ -1,0 +1,26 @@
+# Caddyfile pattern — replace example.com and the upstreams with your own.
+# Wildcard/DNS-01 certs via Cloudflare (matches the CF_API_TOKEN in compose.yml).
+{
+    acme_dns cloudflare {env.CF_API_TOKEN}
+    email you@example.com
+}
+
+# Reuse for backends presenting self-signed TLS (Proxmox, UniFi, Unraid, etc.).
+(tls_backend) {
+    transport http {
+        tls_insecure_skip_verify
+    }
+}
+
+# Plain HTTP upstream
+app.example.com {
+    reverse_proxy 10.0.0.10:8080
+}
+
+# HTTPS upstream with a self-signed cert
+admin.example.com {
+    reverse_proxy https://10.0.0.11:8006 {
+        import tls_backend
+        header_down Location 10.0.0.11 admin.example.com
+    }
+}
