@@ -16,9 +16,9 @@ crate-type = ["rlib"]
 name = "caddy"
 path = "src/main.rs"
 
-# caddy is a BACKEND-ONLY orca plugin: zero #[orca_tool]s. It registers a
-# ServiceBackend across the cdylib FFI seam and reaches the whole orca system
-# through plugin-toolkit alone.
+# caddy is a BACKEND-ONLY orca plugin: zero #[orca_tool]s. It is a subprocess
+# [[bin]] that talks to the orca daemon over its Unix socket via
+# serve_service_plugin! from plugin-toolkit. No FFI/cdylib.
 [dependencies]
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
 
