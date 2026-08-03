@@ -79,9 +79,9 @@ orca drives this plugin through the single generic `service.*` surface — no pe
 
 ```sh
 orca service.deploy caddy      # render + launch on any supported runtime
-orca service.status caddy      # health + rich diagnostics (typed payload)
+orca service.status caddy      # health + rich diagnostics (planned — not yet implemented)
 orca service.backup caddy      # location-agnostic backup (tar; PBS on Proxmox)
-orca service.configure caddy   # apply config via the upstream API
+orca service.configure caddy   # apply config via the upstream API (planned — not yet implemented)
 ```
 
 ## Layout

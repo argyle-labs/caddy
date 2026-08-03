@@ -1,148 +1,87 @@
 # Caddy
 
-Reverse proxy with automatic TLS via Cloudflare DNS-01 challenge. Manages all `*.<your-domain>` HTTPS access. Config lives in the repo — all proxy rules are code.
-
-> Replaced <host> (LXC 104 on <host>) — decommission after Caddy is validated.
+Reverse proxy with automatic TLS. Caddy can issue certificates via an ACME
+DNS-01 challenge (e.g. Cloudflare) so it manages HTTPS for `*.<your-domain>`
+without exposing ports for cert issuance. Proxy rules live in the `Caddyfile` —
+all routing is config.
 
 ---
 
-## Instance
+## Ports
 
 | Field | Value |
 |---|---|
-| Host | <host> (<ip>) |
-| Docker stack | `/opt/stacks/caddy` |
-| Ports | 80, 443 |
-| Admin API | http://localhost:2019 (container-local only) |
+| HTTP | `80` |
+| HTTPS | `443` (TCP + UDP for HTTP/3) |
+| Admin API | `http://localhost:2019` (container-local only) |
 
 ---
 
 ## DNS
 
-AdGuard wildcard: `*.<your-domain>` → `<ip>`
-
-External DNS (Cloudflare): `*.<your-domain>` → WAN IP. TLS certificates issued via Cloudflare DNS-01 — no open ports required for cert issuance.
+Point a wildcard record `*.<your-domain>` at the host running Caddy (internal
+resolver and/or public DNS). With an ACME DNS-01 challenge (e.g. Cloudflare),
+TLS certificates are issued without any open inbound ports for validation.
 
 ---
 
 ## Config
 
-All proxy rules live in `compose/caddy/Caddyfile` in the <repo> repo. To add a service:
+All proxy rules live in the `Caddyfile` mounted into the container at
+`/etc/caddy/Caddyfile` (see the README for the compose/run volume mounts). To
+add a service:
 
-1. Add a block to `Caddyfile`
-2. Push to GitHub
-3. Pull on <host>: `cd /opt/<repo> && git pull`
-4. Reload Caddy: `docker exec caddy caddy reload --config /etc/caddy/Caddyfile`
+1. Add a block to the `Caddyfile`.
+2. Validate it: `docker exec caddy caddy validate --config /etc/caddy/Caddyfile`.
+3. Reload live (no restart): `docker exec caddy caddy reload --config /etc/caddy/Caddyfile`.
 
-No restart needed for config changes — `caddy reload` applies changes live.
+`caddy reload` applies changes without dropping connections.
 
 ---
 
-## Proxy Hosts
+## Proxy hosts
 
-### Infrastructure
+Each reverse-proxy block maps a hostname to an upstream `host:port`. A typical
+route looks like:
 
-| Domain | Backend |
-|---|---|
-| opn.<your-domain> | <ip>:80 |
-| adguard.<your-domain> | <ip>:80 |
-| <host>.<your-domain> | https://<ip>:8006 |
-| <host>.<your-domain> | https://<ip>:8006 |
-| <host>.<your-domain> | https://<ip>:8006 |
-| pbs.<your-domain> | https://<ip>:8007 |
-| unifi.<your-domain> | https://<ip>:8443 |
-| <host>.<your-domain> | https://<ip>:443 |
-| ollama.<your-domain> | <ip>:11434 |
-| <host>.<your-domain> | https://<ip>:443 |
-| dockge.<your-domain> | <ip>:5001 |
+```caddyfile
+app.<your-domain> {
+    reverse_proxy 10.0.0.10:8080
+}
 
-### Home Automation
+dashboard.<your-domain> {
+    reverse_proxy https://10.0.0.11:443
+}
+```
 
-| Domain | Backend |
-|---|---|
-| ha.<your-domain> | <ip>:8123 |
-| zwave.<your-domain> | <ip>:8091 |
-| zigbee.<your-domain> | <ip>:8080 |
-
-### Monitoring / Notifications
-
-| Domain | Backend |
-|---|---|
-| ntfy.<your-domain> | <ip>:8080 |
-| status.<your-domain> | <ip>:3001 |
-
-### Media Stack (<host> — <ip>)
-
-| Domain | Port |
-|---|---|
-| sonarr.<your-domain> | 8989 |
-| radarr.<your-domain> | 7878 |
-| radarr4k.<your-domain> | 7879 |
-| prowlarr.<your-domain> | 9696 |
-| bazarr.<your-domain> | 6767 |
-| sabnzbd.<your-domain> | 8080 |
-| qbittorrent.<your-domain> | 8070 |
-| lidarr.<your-domain> | 8686 |
-| lazylibrarian.<your-domain> | 5299 |
-| kapowarr.<your-domain> | 5656 |
-| mylar3.<your-domain> | 8090 |
-
-### Media / Libraries (<host> — <ip>)
-
-| Domain | Port |
-|---|---|
-| immich.<your-domain> | 2283 |
-| audiobookshelf.<your-domain> | 13378 |
-| calibre.<your-domain> | 8083 |
-| kavita.<your-domain> | 5000 |
-| komga.<your-domain> | 25600 |
-| navidrome.<your-domain> | 4533 |
-
-### Media (LXCs)
-
-| Domain | Backend |
-|---|---|
-| jellyfin.<your-domain> | <ip>:8096 |
+For upstreams that present self-signed certificates, add a TLS-backend snippet
+that skips verification (see the TLS section).
 
 ---
 
 ## Secrets
 
-`CF_API_TOKEN` is stored in <secrets-manager>. On <host>, it lives in `/opt/stacks/caddy/.env` (gitignored).
-
----
-
-## Deployment
-
-### First deploy on <host>
-
-```bash
-ssh <user>@<host>
-mkdir -p /opt/stacks/caddy
-ln -s /opt/<repo>/compose/caddy /opt/stacks/caddy  # if not already symlinked
-echo "CF_API_TOKEN=<token>" > /opt/stacks/caddy/.env
-cd /opt/stacks/caddy && docker compose up -d --build
-```
-
-### DNS cutover
-
-Update AdGuard DNS: `*.<your-domain>` → `<ip>` (was `<ip>`).
-
-### Decommission <host>
-
-Once all subdomains validate:
-```bash
-# On <host>
-pct stop 104
-# Remove from autostart if desired, or destroy:
-# pct destroy 104
-```
+When using an ACME DNS provider, the API token (e.g. `CF_API_TOKEN` for
+Cloudflare) is read from the container environment. Provide it via an `.env`
+file next to your compose file (keep it out of version control) or your secrets
+manager of choice.
 
 ---
 
 ## TLS
 
-Caddy manages certs automatically via Cloudflare DNS-01. Certs are stored in the `caddy_data` Docker volume. The `(tls_backend)` snippet in the Caddyfile disables TLS verification for backends with self-signed certs (Proxmox nodes, Unifi, Unraid).
+Caddy manages certificates automatically. With an ACME DNS-01 provider it can
+issue wildcard certs. Certs are persisted in the `caddy_data` volume (mounted at
+`/data`). A `(tls_backend)` snippet can disable TLS verification for upstreams
+that use self-signed certs:
+
+```caddyfile
+(tls_backend) {
+    transport http {
+        tls_insecure_skip_verify
+    }
+}
+```
 
 ---
 
@@ -158,6 +97,6 @@ docker exec caddy caddy validate --config /etc/caddy/Caddyfile
 # Reload config (no restart)
 docker exec caddy caddy reload --config /etc/caddy/Caddyfile
 
-# Check cert status
+# Inspect the running environment
 docker exec caddy caddy environ
 ```
