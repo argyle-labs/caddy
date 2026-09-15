@@ -2,7 +2,7 @@
 name = "caddy"
 version = "0.1.0"
 edition = "2021"
-description = "Caddy reverse proxy — orca service-backend"
+description = "Caddy reverse proxy plugin for orca — service backend + admin-API status/route inspection (read-only)"
 
 [package.metadata.orca]
 category = "networking"
@@ -16,14 +16,25 @@ crate-type = ["rlib"]
 name = "caddy"
 path = "src/main.rs"
 
-# caddy is a BACKEND-ONLY orca plugin: zero #[orca_tool]s. It is a subprocess
-# [[bin]] that talks to the orca daemon over its Unix socket via
-# serve_service_plugin! from plugin-toolkit. No FFI/cdylib.
+# caddy is a DUAL-facet orca plugin: a `ServiceBackend` PLUS a read-only
+# `#[orca_tool]` surface (endpoint registry + admin-API status/route inspection).
+# It is a subprocess [[bin]] that talks to the orca daemon over its Unix socket
+# via the `Plugin` builder from plugin-toolkit. No FFI/cdylib.
+#
+# Thin profile mirrors adguard: `delegated-http` retargets the HTTP client onto
+# orca's `http.request` capability (links no reqwest/rustls); `tools` supplies
+# the orca_tool anchors and `db` the endpoint_resource CRUD over db_op.
 [dependencies]
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "delegated-http"] }
+
+# Light, genuinely-external deps the plugin's own source names at the crate root.
+serde     = { version = "1", features = ["derive"] }
+schemars  = { version = "1", features = ["derive"] }
+anyhow    = "1"
+tracing   = "0.1"
+thiserror = "2"
 
 [dev-dependencies]
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
 tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 
