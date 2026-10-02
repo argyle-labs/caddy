@@ -6,9 +6,9 @@
 
 Caddy is a fast, automatic-HTTPS web server and reverse proxy.
 
-A first-party [orca](https://github.com/argyle-labs/orca) plugin (service-backend).
+A first-party [orca](https://github.com/argyle-labs/orca) plugin: first-class CRUD over an already-running Caddy instance's reverse-proxy routes (plus config read / reload / status) over its **admin API** — so you stop hand-editing the `Caddyfile`.
 
-This repo is **self-contained** — the steps below run caddy **by hand, without orca**. orca automates exactly this (same image, ports, and data) through one generic surface.
+This repo is **self-contained** — the steps below run caddy **by hand, without orca**. orca then drives the running instance's routes through the tools below (and automates deploy/backup via the generic `service.*` surface).
 
 ---
 
@@ -75,18 +75,35 @@ Back up the config/data volume(s) above — that's the whole service state (stop
 
 ## With orca
 
-orca drives this plugin through the single generic `service.*` surface — no per-plugin tools:
+Register a running Caddy instance as an endpoint (its `routes` point at the **admin API**, default `:2019`), then drive its reverse-proxy routes:
 
 ```sh
-orca service.deploy caddy      # render + launch on any supported runtime
-orca service.status caddy      # health + rich diagnostics (planned — not yet implemented)
-orca service.backup caddy      # location-agnostic backup (tar; PBS on Proxmox)
-orca service.configure caddy   # apply config via the upstream API (planned — not yet implemented)
+# Register the instance (routes are an ordered, reachable-first fallback list).
+orca caddy.create --name edge \
+    --route lan=http://10.0.0.5:2019 --insecure false --enabled true
+orca caddy.list                                      # registered endpoints
+orca caddy.status --name edge                        # reachable + server/route/upstream counts
+orca caddy.config.get --name edge                    # full current config JSON
+
+# Reverse-proxy routes (hostname → upstream)
+orca caddy.route.list   --name edge
+orca caddy.route.set    --name edge --host service.example.com --upstream 10.0.0.9:8080
+orca caddy.route.set    --name edge --host service.example.com --upstream 10.0.0.9:8080,10.0.0.10:8080  # multiple upstreams
+orca caddy.route.delete --name edge --host service.example.com
+orca caddy.reload       --name edge                  # re-apply the running config
 ```
+
+`caddy.route.set` is idempotent: an existing route for the host has its upstreams replaced in place, otherwise a new route is appended. Edits are surgical — only the target server's `routes` array is written back (`PATCH /config/apps/http/servers/<server>/routes`), leaving TLS automation and other apps untouched. When an instance has more than one http server, pass `--server <name>`.
+
+The admin API is unauthenticated on `localhost:2019` by default. To drive it remotely, bind it to a reachable address in the Caddyfile global block (`admin 0.0.0.0:2019`) and — if you front it with auth — store the token in orca's secrets domain (`caddy.<endpoint>.api_key`, sent as a bearer token); `--insecure true` skips TLS verification for a self-signed https admin front-end.
+
+> Deploy/backup ride the generic `service.*` surface: `orca service.deploy caddy`, `orca service.backup caddy` (location-agnostic; tar, or PBS on Proxmox). `service.status` / `service.configure` are planned.
 
 ## Layout
 
-- `src/` — the plugin (pure Rust): the `ServiceBackend` descriptor + `configure` / `status`.
+- `src/lib.rs` — the Caddy admin-API client (`Config`, config/route/reload ops) + the `ServiceBackend`.
+- `src/tools.rs` — the `#[endpoint_resource]` registry + `caddy.*` tools.
+- `src/main.rs` — the `Plugin` builder entrypoint (dual facet: service + tools).
 - `docs/` — standalone operator notes.
-- [CAPABILITIES.md](CAPABILITIES.md) — the service-backend contract checklist.
+- [CAPABILITIES.md](CAPABILITIES.md) — the plugin contract checklist.
 - `assets/` — plugin icon.
