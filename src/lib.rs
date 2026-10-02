@@ -1,30 +1,48 @@
-//! caddy service backend + read-only admin-API client.
+//! Caddy admin-API client + service backend.
 //!
-//! Implements `ServiceBackend` so the generic `service.*` tools
-//! (deploy/backup/restore/configure/status/connect/sync) drive caddy. ALONGSIDE
-//! it, a read-only `#[orca_tool]` surface ([`tools`]) inspects a running Caddy
-//! over its admin API (default `:2019`): `caddy.status` and `caddy.route.list`.
-//! Modeled on the adguard/nfs backends. See orca/docs/PLUGIN-PROGRAM.md.
+//! Drives an already-running Caddy reverse proxy over its documented admin API
+//! (default `http://localhost:2019`, but the endpoint is per-instance). The
+//! operational surface is reverse-proxy route management (hostname → upstream)
+//! plus config read / reload / status — so you stop hand-editing the Caddyfile.
 //!
 //! The wire surface is the toolkit's cap-backed HTTP client (`delegated-http`),
 //! so every request rides orca's `http.request` capability and this plugin links
-//! no reqwest/rustls. Hand-written call sites join their admin route onto
-//! [`Config::base_url`]. This slice is READ-ONLY — no config-write / route-CRUD.
+//! no reqwest/rustls. Hand-written call sites join their `/config/...` route onto
+//! [`Config::base_url`].
+//!
+//! ## Route model — surgical `/config/...` edits, not full `/load`
+//! Caddy has no "upsert route by host" primitive and applies every admin write
+//! live. We therefore read the full config once (`GET /config/`), mutate only the
+//! target server's `routes` array in memory (least-destructive: an existing route
+//! matching the host has its `reverse_proxy` upstreams replaced in place; a new
+//! host is appended as a canonical route), then write just that subtree back with
+//! `PATCH /config/apps/http/servers/<srv>/routes`. This leaves TLS automation and
+//! every other app untouched — unlike `POST /load`, which replaces the whole
+//! config. `caddy.reload` is the one deliberate full re-apply (see [`reload`]).
+
 #![allow(clippy::disallowed_types)]
 
 pub mod tools;
 
 use plugin_toolkit::reqwest;
-use plugin_toolkit::serde_json;
+use plugin_toolkit::serde_json::{json, Value};
 use plugin_toolkit::service::{
-    BoxFuture, Endpoint, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
+    BoxFuture, Routes, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
     WorkloadSpec,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// caddy backend. Holds only the provider name; per-instance endpoint/creds
-/// come from the `Endpoint` the generic `service.*` tools hand each op.
+/// caddy service backend — Caddy reverse proxy.
+///
+/// Implements `ServiceBackend` so the generic `service.*` tools
+/// (deploy/backup/restore/configure/status/connect/sync) drive caddy. This facet
+/// is registered ALONGSIDE the `#[orca_tool]` route-management surface in
+/// [`tools`] — one binary, both facets, via the `Plugin` builder. Modeled on the
+/// adguard/nfs backends. See orca/docs/PLUGIN-PROGRAM.md.
+///
+/// Holds only the provider name; per-instance routes/creds come from the
+/// `Routes` the generic `service.*` tools hand each op.
 #[derive(Debug, Clone)]
 pub struct CaddyBackend {
     provider: &'static str,
@@ -67,13 +85,14 @@ impl ServiceBackend for CaddyBackend {
     /// Proxmox guests when available) snapshots these. No backup/restore code
     /// here; those are inherited from ServiceBackend's defaults.
     fn data_paths(&self) -> Vec<String> {
-        vec!["/config".to_string()]
+        vec!["/config".to_string(), "/data".to_string()]
     }
 
     fn workload_spec<'a>(
         &'a self,
         _runtime: Runtime,
-        _ep: &'a Endpoint,
+        _instance: &'a str,
+        _routes: &'a Routes,
     ) -> BoxFuture<'a, Result<WorkloadSpec, ServiceError>> {
         // TODO: describe the caddy workload (image/template, ports, mounts,
         // env) for the chosen runtime. The deploy target turns this into a
@@ -83,7 +102,8 @@ impl ServiceBackend for CaddyBackend {
 
     fn configure<'a>(
         &'a self,
-        _ep: &'a Endpoint,
+        _instance: &'a str,
+        _routes: &'a Routes,
         _config: &'a str,
     ) -> BoxFuture<'a, Result<(), ServiceError>> {
         // TODO: apply caddy-specific config idempotently.
@@ -92,7 +112,8 @@ impl ServiceBackend for CaddyBackend {
 
     fn status<'a>(
         &'a self,
-        _ep: &'a Endpoint,
+        _instance: &'a str,
+        _routes: &'a Routes,
     ) -> BoxFuture<'a, Result<ServiceStatus, ServiceError>> {
         // TODO: real health/diagnostics.
         Box::pin(async move { Err(ServiceError::unimplemented("caddy.status")) })
@@ -100,50 +121,55 @@ impl ServiceBackend for CaddyBackend {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Read-only admin-API client
+// Surfaced view types
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// A small liveness/shape summary derived from Caddy's admin config.
+/// A single reverse-proxy route as surfaced by `caddy.route.list`/`set`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct Status {
-    /// `true` if the admin API answered `GET /config/` with 2xx.
-    pub reachable: bool,
-    /// Number of HTTP servers under `apps.http.servers`.
-    pub servers: usize,
-    /// Total number of routes across all servers.
-    pub routes: usize,
+pub struct Route {
+    /// The http server this route lives under (`apps.http.servers.<server>`).
+    pub server: String,
+    /// The hostnames this route matches (`match[].host[]`).
+    pub hosts: Vec<String>,
+    /// The reverse-proxy upstream dial addresses (`handle[].upstreams[].dial`).
+    pub upstreams: Vec<String>,
 }
 
-/// One reverse-proxy route resolved out of a server's `routes[]`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct CaddyRoute {
-    /// The `apps.http.servers.<name>` this route belongs to.
-    pub server: String,
-    /// Host matchers (`match[].host`), flattened. May be empty.
-    pub host: Vec<String>,
-    /// Reverse-proxy upstreams (`reverse_proxy` handler's `upstreams[].dial`).
-    pub upstreams: Vec<String>,
-    /// The route's `@id`, if it declares one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
+/// The subset of running state `caddy.status` surfaces. Caddy's admin API exposes
+/// no version endpoint, so status is derived from `GET /config/` reachability.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Status {
+    /// `GET /config/` returned 2xx.
+    pub reachable: bool,
+    /// Names of the configured `apps.http.servers`.
+    pub servers: Vec<String>,
+    /// Total reverse-proxy routes across all http servers.
+    pub routes: usize,
+    /// Live upstreams reported by `GET /reverse_proxy/upstreams`.
+    pub upstreams: usize,
 }
 
 #[derive(Debug, Error)]
 pub enum CaddyError {
     #[error("caddy transport: {0}")]
     Transport(String),
-    #[error("caddy admin api error (status {status}): {body}")]
+    #[error("caddy api error (status {status}): {body}")]
     Api { status: u16, body: String },
     #[error("malformed caddy response: {0}")]
     Malformed(String),
+    #[error("caddy config: {0}")]
+    Config(String),
 }
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Base URL of the Caddy admin API (e.g. `http://host:2019`). The admin API
-    /// path is joined onto this.
+    /// Base URL of the Caddy admin API (e.g. `http://10.0.0.5:2019`). The
+    /// `/config/...` API path is joined onto this.
     pub base_url: String,
-    /// Skip TLS verification (self-signed homelab certs on an https front-end).
+    /// Optional bearer token. The admin API is unauthenticated on localhost by
+    /// default; set this only when a front-end/proxy guards it.
+    pub api_key: Option<String>,
+    /// Skip TLS verification (self-signed cert on an https admin front-end).
     pub insecure: bool,
 }
 
@@ -151,8 +177,14 @@ impl Config {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
+            api_key: None,
             insecure: false,
         }
+    }
+
+    pub fn api_key(mut self, key: Option<String>) -> Self {
+        self.api_key = key.filter(|k| !k.is_empty());
+        self
     }
 
     pub fn insecure(mut self, on: bool) -> Self {
@@ -160,17 +192,22 @@ impl Config {
         self
     }
 
-    /// Build the cap-backed HTTP client with TLS verification toggled per
-    /// `insecure`. Caddy's admin API is unauthenticated by default, so no auth
-    /// header is attached in this slice.
+    /// Build the cap-backed HTTP client, attaching a bearer `authorization`
+    /// header only when an api_key is configured (admin API is usually open).
     pub fn build_client(&self) -> Result<reqwest::Client, CaddyError> {
-        plugin_toolkit::api_client::ApiClientBuilder::new()
+        let mut builder = plugin_toolkit::api_client::ApiClientBuilder::new();
+        if let Some(key) = &self.api_key {
+            builder = builder
+                .header("authorization", format!("Bearer {key}"))
+                .map_err(|e| CaddyError::Transport(format!("client build: {e}")))?;
+        }
+        builder
             .insecure(self.insecure)
             .build()
             .map_err(|e| CaddyError::Transport(format!("client build: {e}")))
     }
 
-    /// Join an admin-API `<path>` onto the base URL.
+    /// Join an admin-API `path` onto the base URL (leading `/` optional).
     fn admin_url(&self, path: &str) -> String {
         format!(
             "{}/{}",
@@ -184,15 +221,14 @@ fn transport(e: impl std::fmt::Display) -> CaddyError {
     CaddyError::Transport(e.to_string())
 }
 
-/// `GET /config/apps/http/servers` — the HTTP servers config object, keyed by
-/// server name. A missing `apps.http` returns `null`; callers treat that as an
-/// empty server set. A 2xx here also proves the admin API is reachable.
-async fn get_servers(
-    client: &reqwest::Client,
-    cfg: &Config,
-) -> Result<serde_json::Value, CaddyError> {
+// ═══════════════════════════════════════════════════════════════════════════
+// Admin-API primitives
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `GET /config/` — the full current config as JSON.
+pub async fn get_config(client: &reqwest::Client, cfg: &Config) -> Result<Value, CaddyError> {
     let resp = client
-        .get(cfg.admin_url("config/apps/http/servers"))
+        .get(cfg.admin_url("config/"))
         .send()
         .await
         .map_err(transport)?;
@@ -204,139 +240,263 @@ async fn get_servers(
             body,
         });
     }
+    // An empty config comes back as the literal `null`; normalize to an object.
+    if body.trim().is_empty() || body.trim() == "null" {
+        return Ok(json!({}));
+    }
     plugin_toolkit::serde_json::from_str(&body).map_err(|e| CaddyError::Malformed(e.to_string()))
 }
 
-/// Read a running Caddy's liveness + server/route counts. A transport failure
-/// (admin API down/unreachable) maps to `reachable: false` rather than a hard
-/// error; a non-2xx HTTP response is still surfaced as an error.
-pub async fn status(client: &reqwest::Client, cfg: &Config) -> Result<Status, CaddyError> {
-    let servers = match get_servers(client, cfg).await {
-        Ok(v) => v,
-        Err(CaddyError::Transport(_)) => {
-            return Ok(Status {
-                reachable: false,
-                servers: 0,
-                routes: 0,
-            })
-        }
-        Err(e) => return Err(e),
-    };
-    Ok(count_status(&servers))
-}
-
-/// List every reverse-proxy route across all servers.
-pub async fn list_routes(
+/// `POST /load` — replace the entire config. Forces a reload even if unchanged.
+pub async fn load_config(
     client: &reqwest::Client,
     cfg: &Config,
-) -> Result<Vec<CaddyRoute>, CaddyError> {
-    let servers = get_servers(client, cfg).await?;
-    Ok(parse_routes(&servers))
+    config: &Value,
+) -> Result<(), CaddyError> {
+    let resp = client
+        .post(cfg.admin_url("load"))
+        .header(
+            "cache-control",
+            reqwest::header::HeaderValue::from_static("must-revalidate"),
+        )
+        .json(config)
+        .send()
+        .await
+        .map_err(transport)?;
+    ok_or_api(resp).await
 }
 
-/// Derive a [`Status`] from a `servers` config object (the value of
-/// `apps.http.servers`). Counts servers and sums each server's `routes[]` len.
-pub fn count_status(servers: &serde_json::Value) -> Status {
-    let Some(map) = servers.as_object() else {
-        return Status {
-            reachable: true,
-            servers: 0,
-            routes: 0,
-        };
+/// `PATCH /config/<path>` — strictly replace the value at an existing config
+/// path. Used to write one server's `routes` array back after an in-memory edit.
+pub async fn patch_path(
+    client: &reqwest::Client,
+    cfg: &Config,
+    path: &str,
+    value: &Value,
+) -> Result<(), CaddyError> {
+    let resp = client
+        .patch(cfg.admin_url(&format!("config/{}", path.trim_start_matches('/'))))
+        .json(value)
+        .send()
+        .await
+        .map_err(transport)?;
+    ok_or_api(resp).await
+}
+
+/// Number of live upstreams from `GET /reverse_proxy/upstreams` (0 if the
+/// endpoint is unavailable on this build).
+pub async fn upstream_count(client: &reqwest::Client, cfg: &Config) -> usize {
+    let Ok(resp) = client
+        .get(cfg.admin_url("reverse_proxy/upstreams"))
+        .send()
+        .await
+    else {
+        return 0;
     };
-    let routes = map
-        .values()
-        .filter_map(|s| s.get("routes").and_then(|r| r.as_array()))
-        .map(|r| r.len())
-        .sum();
-    Status {
-        reachable: true,
-        servers: map.len(),
-        routes,
+    if !resp.status().is_success() {
+        return 0;
+    }
+    let Ok(body) = resp.text().await else {
+        return 0;
+    };
+    plugin_toolkit::serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|v| v.as_array().map(|a| a.len()))
+        .unwrap_or(0)
+}
+
+async fn ok_or_api(resp: reqwest::Response) -> Result<(), CaddyError> {
+    let status = resp.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        Err(CaddyError::Api {
+            status: status.as_u16(),
+            body,
+        })
     }
 }
 
-/// Walk a `servers` config object and extract every reverse-proxy route.
-///
-/// For each `apps.http.servers.<name>.routes[]` entry we collect the host
-/// matchers (`match[].host`) and any reverse-proxy upstreams. Handlers nest —
-/// a `subroute` handler wraps its own `routes[]` — so [`collect_upstreams`]
-/// walks `handle[]` recursively, descending into `subroute`/`route` inner
-/// routes and collecting the `upstreams[].dial` of every `reverse_proxy`
-/// handler it finds. A route that resolves to no reverse-proxy handler is
-/// skipped; a route with no host matcher is kept with an empty `host`.
-pub fn parse_routes(servers: &serde_json::Value) -> Vec<CaddyRoute> {
+// ═══════════════════════════════════════════════════════════════════════════
+// Route operations (read-modify-write on the routes array)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Enumerate every reverse-proxy route across all http servers.
+pub fn list_routes(config: &Value) -> Vec<Route> {
     let mut out = Vec::new();
-    let Some(map) = servers.as_object() else {
+    let Some(servers) = servers_map(config) else {
         return out;
     };
-    for (server, server_cfg) in map {
-        let Some(routes) = server_cfg.get("routes").and_then(|r| r.as_array()) else {
-            continue;
-        };
-        for route in routes {
-            let mut upstreams = Vec::new();
-            if let Some(handle) = route.get("handle").and_then(|h| h.as_array()) {
-                collect_upstreams(handle, &mut upstreams);
+    for (server, srv) in servers {
+        for route in server_routes(srv) {
+            if let Some(upstreams) = route_upstreams(route) {
+                out.push(Route {
+                    server: server.clone(),
+                    hosts: route_hosts(route),
+                    upstreams,
+                });
             }
-            // Skip non-proxy routes: nothing to report for this read-only view.
-            if upstreams.is_empty() {
-                continue;
-            }
-            let host = route
-                .get("match")
-                .and_then(|m| m.as_array())
-                .map(|matchers| {
-                    matchers
-                        .iter()
-                        .filter_map(|m| m.get("host").and_then(|h| h.as_array()))
-                        .flatten()
-                        .filter_map(|h| h.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let id = route
-                .get("@id")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            out.push(CaddyRoute {
-                server: server.clone(),
-                host,
-                upstreams,
-                id,
-            });
         }
     }
     out
 }
 
-/// Recursively walk a `handle[]` array, appending the `upstreams[].dial` of
-/// every `reverse_proxy` handler. Descends into `subroute`/`route` handlers,
-/// which nest their own `routes[]` (each with its own `handle[]`).
-fn collect_upstreams(handle: &[serde_json::Value], out: &mut Vec<String>) {
-    for h in handle {
-        match h.get("handler").and_then(|v| v.as_str()) {
-            Some("reverse_proxy") => {
-                if let Some(ups) = h.get("upstreams").and_then(|u| u.as_array()) {
-                    for u in ups {
-                        if let Some(dial) = u.get("dial").and_then(|d| d.as_str()) {
-                            out.push(dial.to_string());
-                        }
-                    }
-                }
+/// Total reverse-proxy routes across all http servers.
+pub fn route_count(config: &Value) -> usize {
+    list_routes(config).len()
+}
+
+/// The names of the configured `apps.http.servers`.
+pub fn server_names(config: &Value) -> Vec<String> {
+    servers_map(config)
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Pick the http server to operate on: the caller's choice if given, else the
+/// sole server. Errors (listing candidates) when the choice is ambiguous/absent.
+pub fn choose_server(config: &Value, requested: Option<&str>) -> Result<String, CaddyError> {
+    let names = server_names(config);
+    match requested {
+        Some(name) => {
+            if names.iter().any(|n| n == name) {
+                Ok(name.to_string())
+            } else {
+                Err(CaddyError::Config(format!(
+                    "no http server '{name}' (have: {})",
+                    join_or_none(&names)
+                )))
             }
-            Some("subroute") => {
-                if let Some(routes) = h.get("routes").and_then(|r| r.as_array()) {
-                    for inner in routes {
-                        if let Some(inner_handle) = inner.get("handle").and_then(|ih| ih.as_array())
-                        {
-                            collect_upstreams(inner_handle, out);
-                        }
-                    }
-                }
-            }
-            _ => {}
         }
+        None => match names.as_slice() {
+            [only] => Ok(only.clone()),
+            [] => Err(CaddyError::Config(
+                "no apps.http.servers configured; specify --server".into(),
+            )),
+            _ => Err(CaddyError::Config(format!(
+                "multiple http servers ({}); specify --server",
+                join_or_none(&names)
+            ))),
+        },
+    }
+}
+
+/// Least-destructive upsert of one server's routes: if a route already matches
+/// `host`, replace its reverse_proxy upstreams in place (preserving its other
+/// fields); otherwise append a canonical `host → upstreams` route. Returns the
+/// new routes array for that server. Pure — the caller PATCHes it back.
+pub fn upsert_route(
+    config: &Value,
+    server: &str,
+    host: &str,
+    upstreams: &[String],
+) -> Result<Value, CaddyError> {
+    let mut routes = server_routes_owned(config, server);
+    let dials: Vec<Value> = upstreams.iter().map(|u| json!({ "dial": u })).collect();
+
+    if let Some(route) = routes
+        .iter_mut()
+        .find(|r| route_upstreams(r).is_some() && route_matches_host(r, host))
+    {
+        // Replace the reverse_proxy handler's upstreams in place.
+        if let Some(handlers) = route.get_mut("handle").and_then(Value::as_array_mut) {
+            for h in handlers {
+                if h.get("handler").and_then(Value::as_str) == Some("reverse_proxy") {
+                    h["upstreams"] = Value::Array(dials.clone());
+                }
+            }
+        }
+    } else {
+        routes.push(json!({
+            "match": [{ "host": [host] }],
+            "handle": [{ "handler": "reverse_proxy", "upstreams": dials }],
+            "terminal": true,
+        }));
+    }
+    Ok(Value::Array(routes))
+}
+
+/// Drop every reverse-proxy route matching `host` from a server; returns the new
+/// routes array and whether anything was removed.
+pub fn delete_route(config: &Value, server: &str, host: &str) -> (Value, bool) {
+    let routes = server_routes_owned(config, server);
+    let before = routes.len();
+    let kept: Vec<Value> = routes
+        .into_iter()
+        .filter(|r| !(route_upstreams(r).is_some() && route_matches_host(r, host)))
+        .collect();
+    let removed = kept.len() != before;
+    (Value::Array(kept), removed)
+}
+
+// ── pure helpers over the config Value ──────────────────────────────────────
+
+fn servers_map(config: &Value) -> Option<&plugin_toolkit::serde_json::Map<String, Value>> {
+    config.get("apps")?.get("http")?.get("servers")?.as_object()
+}
+
+fn server_routes(srv: &Value) -> &[Value] {
+    srv.get("routes")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn server_routes_owned(config: &Value, server: &str) -> Vec<Value> {
+    servers_map(config)
+        .and_then(|m| m.get(server))
+        .map(server_routes)
+        .map(<[Value]>::to_vec)
+        .unwrap_or_default()
+}
+
+/// The `handle[].reverse_proxy.upstreams[].dial` list, or `None` if the route has
+/// no reverse_proxy handler.
+fn route_upstreams(route: &Value) -> Option<Vec<String>> {
+    let handlers = route.get("handle")?.as_array()?;
+    let mut found = false;
+    let mut dials = Vec::new();
+    for h in handlers {
+        if h.get("handler").and_then(Value::as_str) == Some("reverse_proxy") {
+            found = true;
+            if let Some(ups) = h.get("upstreams").and_then(Value::as_array) {
+                for u in ups {
+                    if let Some(d) = u.get("dial").and_then(Value::as_str) {
+                        dials.push(d.to_string());
+                    }
+                }
+            }
+        }
+    }
+    found.then_some(dials)
+}
+
+fn route_hosts(route: &Value) -> Vec<String> {
+    let mut hosts = Vec::new();
+    if let Some(matchers) = route.get("match").and_then(Value::as_array) {
+        for m in matchers {
+            if let Some(hs) = m.get("host").and_then(Value::as_array) {
+                for h in hs {
+                    if let Some(s) = h.as_str() {
+                        hosts.push(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    hosts
+}
+
+fn route_matches_host(route: &Value, host: &str) -> bool {
+    route_hosts(route).iter().any(|h| h == host)
+}
+
+fn join_or_none(names: &[String]) -> String {
+    if names.is_empty() {
+        "none".to_string()
+    } else {
+        names.join(", ")
     }
 }
 
@@ -344,99 +504,95 @@ fn collect_upstreams(handle: &[serde_json::Value], out: &mut Vec<String>) {
 mod tests {
     use super::*;
 
+    fn sample() -> Value {
+        json!({
+            "apps": { "http": { "servers": {
+                "srv0": { "listen": [":443"], "routes": [
+                    {
+                        "match": [{ "host": ["a.example.com"] }],
+                        "handle": [{ "handler": "reverse_proxy",
+                                     "upstreams": [{ "dial": "10.0.0.5:8080" }] }],
+                        "terminal": true
+                    },
+                    {
+                        "match": [{ "host": ["static.example.com"] }],
+                        "handle": [{ "handler": "file_server" }]
+                    }
+                ]}
+            }}}
+        })
+    }
+
     #[test]
     fn declares_provider() {
-        let b = CaddyBackend::new("caddy");
-        assert_eq!(b.provider(), "caddy");
+        assert_eq!(CaddyBackend::new("caddy").provider(), "caddy");
     }
 
     #[test]
     fn admin_url_joins_cleanly() {
         let cfg = Config::new("http://host:2019/");
-        assert_eq!(
-            cfg.admin_url("config/apps/http/servers"),
-            "http://host:2019/config/apps/http/servers"
-        );
-        assert_eq!(cfg.admin_url("/config/"), "http://host:2019/config/");
-    }
-
-    /// Realistic `apps.http.servers` blob: one direct host→reverse_proxy route,
-    /// one route whose proxy is nested inside a `subroute`, and one non-proxy
-    /// route (static_response) that must be skipped.
-    fn sample_servers() -> serde_json::Value {
-        plugin_toolkit::serde_json::json!({
-            "srv0": {
-                "routes": [
-                    {
-                        "@id": "app",
-                        "match": [{ "host": ["app.example.com"] }],
-                        "handle": [
-                            {
-                                "handler": "reverse_proxy",
-                                "upstreams": [{ "dial": "10.0.0.10:8080" }]
-                            }
-                        ]
-                    },
-                    {
-                        "match": [{ "host": ["nested.example.com"] }],
-                        "handle": [
-                            {
-                                "handler": "subroute",
-                                "routes": [
-                                    {
-                                        "handle": [
-                                            {
-                                                "handler": "reverse_proxy",
-                                                "upstreams": [{ "dial": "10.0.0.11:9090" }]
-                                            }
-                                        ]
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        "match": [{ "host": ["static.example.com"] }],
-                        "handle": [
-                            { "handler": "static_response", "body": "ok" }
-                        ]
-                    }
-                ]
-            }
-        })
+        assert_eq!(cfg.admin_url("config/"), "http://host:2019/config/");
+        assert_eq!(cfg.admin_url("/load"), "http://host:2019/load");
     }
 
     #[test]
-    fn parse_routes_extracts_direct_and_nested_skips_non_proxy() {
-        let routes = parse_routes(&sample_servers());
-        assert_eq!(routes.len(), 2, "non-proxy route must be skipped");
-
-        let app = &routes[0];
-        assert_eq!(app.server, "srv0");
-        assert_eq!(app.host, vec!["app.example.com"]);
-        assert_eq!(app.upstreams, vec!["10.0.0.10:8080"]);
-        assert_eq!(app.id.as_deref(), Some("app"));
-
-        let nested = &routes[1];
-        assert_eq!(nested.host, vec!["nested.example.com"]);
-        assert_eq!(nested.upstreams, vec!["10.0.0.11:9090"], "subroute walked");
-        assert_eq!(nested.id, None);
+    fn list_routes_surfaces_only_reverse_proxy() {
+        let routes = list_routes(&sample());
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].server, "srv0");
+        assert_eq!(routes[0].hosts, vec!["a.example.com"]);
+        assert_eq!(routes[0].upstreams, vec!["10.0.0.5:8080"]);
     }
 
     #[test]
-    fn count_status_counts_servers_and_routes() {
-        let s = count_status(&sample_servers());
-        assert!(s.reachable);
-        assert_eq!(s.servers, 1);
-        assert_eq!(s.routes, 3, "counts every route, proxy or not");
+    fn choose_server_picks_sole_and_rejects_missing() {
+        let cfg = sample();
+        assert_eq!(choose_server(&cfg, None).unwrap(), "srv0");
+        assert_eq!(choose_server(&cfg, Some("srv0")).unwrap(), "srv0");
+        assert!(choose_server(&cfg, Some("nope")).is_err());
     }
 
     #[test]
-    fn parse_routes_tolerates_empty_config() {
-        assert!(parse_routes(&serde_json::Value::Null).is_empty());
-        let s = count_status(&serde_json::Value::Null);
-        assert!(s.reachable);
-        assert_eq!(s.servers, 0);
-        assert_eq!(s.routes, 0);
+    fn upsert_updates_existing_host_in_place() {
+        let cfg = sample();
+        let routes = upsert_route(&cfg, "srv0", "a.example.com", &["10.0.0.9:80".into()]).unwrap();
+        let arr = routes.as_array().unwrap();
+        // No new route appended — still two, and the file_server route is intact.
+        assert_eq!(arr.len(), 2);
+        assert_eq!(route_upstreams(&arr[0]).unwrap(), vec!["10.0.0.9:80"]);
+        assert_eq!(route_hosts(&arr[1]), vec!["static.example.com"]);
+    }
+
+    #[test]
+    fn upsert_appends_new_host() {
+        let cfg = sample();
+        let routes =
+            upsert_route(&cfg, "srv0", "b.example.com", &["10.0.0.7:3000".into()]).unwrap();
+        let arr = routes.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        let last = arr.last().unwrap();
+        assert_eq!(route_hosts(last), vec!["b.example.com"]);
+        assert_eq!(route_upstreams(last).unwrap(), vec!["10.0.0.7:3000"]);
+        assert_eq!(last.get("terminal").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn delete_removes_matching_reverse_proxy_route() {
+        let cfg = sample();
+        let (routes, removed) = delete_route(&cfg, "srv0", "a.example.com");
+        assert!(removed);
+        let arr = routes.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(route_hosts(&arr[0]), vec!["static.example.com"]);
+
+        let (_, removed_none) = delete_route(&cfg, "srv0", "missing.example.com");
+        assert!(!removed_none);
+    }
+
+    #[test]
+    fn server_names_and_route_count() {
+        let cfg = sample();
+        assert_eq!(server_names(&cfg), vec!["srv0"]);
+        assert_eq!(route_count(&cfg), 1);
     }
 }
