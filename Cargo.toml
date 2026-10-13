@@ -25,7 +25,7 @@ path = "src/main.rs"
 # orca's `http.request` capability (links no reqwest/rustls); `tools` supplies
 # the orca_tool anchors and `db` the endpoint_resource CRUD over db_op.
 [dependencies]
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "delegated-http"] }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", package = "orca-plugin-toolkit", default-features = false, features = ["tools", "db", "delegated-http"] }
 
 # Light, genuinely-external deps the plugin's own source names at the crate root.
 serde     = { version = "1", features = ["derive"] }
