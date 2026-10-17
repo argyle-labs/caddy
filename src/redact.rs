@@ -33,6 +33,59 @@ fn sensitive(key: &str) -> bool {
         || n.ends_with("uri")
 }
 
+const SENSITIVE_PARAMS: &[&str] = &[
+    "signature",
+    "sig",
+    "credential",
+    "x-amz-signature",
+    "x-amz-credential",
+    "x-amz-security-token",
+];
+
+const DNS_CHALLENGE_PUBLIC: &[&str] = &[
+    "ttl",
+    "resolvers",
+    "override_domain",
+    "propagation_delay",
+    "propagation_timeout",
+];
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match (
+            bytes[i],
+            bytes.get(i + 1).copied().and_then(hex),
+            bytes.get(i + 2).copied().and_then(hex),
+        ) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (b'+', _, _) => {
+                out.push(b' ');
+                i += 1;
+            }
+            (b, _, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn sensitive_param(raw: &str) -> bool {
+    let name = percent_decode(raw);
+    is_sensitive_key(&name)
+        || SENSITIVE_PARAMS
+            .iter()
+            .any(|p| name.eq_ignore_ascii_case(p))
+}
+
 fn redact_query(tail: &str) -> String {
     let Some((before, query)) = tail.split_once('?') else {
         return tail.to_string();
@@ -44,7 +97,7 @@ fn redact_query(tail: &str) -> String {
     let query: Vec<String> = query
         .split('&')
         .map(|pair| match pair.split_once('=') {
-            Some((k, _)) if is_sensitive_key(k) => format!("{k}={REDACTED}"),
+            Some((k, _)) if sensitive_param(k) => format!("{k}={REDACTED}"),
             _ => pair.to_string(),
         })
         .collect();
@@ -65,10 +118,13 @@ fn clean_token(token: &str) -> String {
             };
             format!("{scheme}://{}", redact_query(&rest))
         }
-        None => match token.rsplit_once('@') {
-            Some((userinfo, after)) if userinfo.contains(':') => format!("{REDACTED}@{after}"),
-            _ => token.to_string(),
-        },
+        None => {
+            let token = match token.rsplit_once('@') {
+                Some((userinfo, after)) if userinfo.contains(':') => format!("{REDACTED}@{after}"),
+                _ => token.to_string(),
+            };
+            redact_query(&token)
+        }
     }
 }
 
@@ -99,13 +155,28 @@ fn walk(value: &mut Value, path: &str, out: &mut Vec<String>) {
         Value::Object(map) => {
             for (k, v) in map.iter_mut() {
                 let here = format!("{path}/{}", escape(k));
-                if sensitive(k) {
+                if k == "dns" && path.ends_with("/challenges") && v.is_object() {
+                    if let Some(dns) = v.as_object_mut() {
+                        for (dk, dv) in dns.iter_mut() {
+                            let at = format!("{here}/{}", escape(dk));
+                            if dk == "provider" || DNS_CHALLENGE_PUBLIC.contains(&dk.as_str()) {
+                                let mut wrapper = plugin_toolkit::serde_json::Map::new();
+                                wrapper.insert(dk.clone(), std::mem::take(dv));
+                                let mut wrapped = Value::Object(wrapper);
+                                walk(&mut wrapped, &here, out);
+                                if let Some(back) = wrapped.get_mut(dk.as_str()) {
+                                    *dv = std::mem::take(back);
+                                }
+                            } else {
+                                *dv = Value::String(REDACTED.to_string());
+                                out.push(at);
+                            }
+                        }
+                    }
+                } else if sensitive(k) {
                     *v = Value::String(REDACTED.to_string());
                     out.push(here);
-                } else if let Some((_, keep)) = WHOLESALE
-                    .iter()
-                    .find(|(key, _)| key == k && !(k == "dns" && path.ends_with("/challenges")))
-                {
+                } else if let Some((_, keep)) = WHOLESALE.iter().find(|(key, _)| key == k) {
                     if let Some(module) = v.as_object_mut() {
                         for (mk, mv) in module
                             .iter_mut()
@@ -287,5 +358,60 @@ mod tests {
             r.redacted
         );
         assert!(text.contains("120s"), "{text}");
+    }
+
+    #[test]
+    fn schemeless_and_encoded_query_names_are_redacted() {
+        assert_eq!(
+            strip_userinfo("host/path?token=abc").unwrap(),
+            "host/path?token=<redacted>"
+        );
+        assert_eq!(
+            strip_userinfo("https://x.example.com/a?api%5Fkey=x&v=1").unwrap(),
+            "https://x.example.com/a?api%5Fkey=<redacted>&v=1"
+        );
+    }
+
+    #[test]
+    fn presigned_s3_urls_are_redacted() {
+        let url = "https://bucket.s3.amazonaws.com/k?X-Amz-Algorithm=AWS4-HMAC-SHA256\
+                   &X-Amz-Credential=AKIA%2F20260101&X-Amz-Signature=deadbeef\
+                   &X-Amz-Security-Token=tok&sig=s1&X-Amz-Expires=60";
+        let out = strip_userinfo(url).unwrap();
+        for leaked in ["AKIA", "deadbeef", "=tok", "s1"] {
+            assert!(!out.contains(leaked), "{leaked} in {out}");
+        }
+        assert!(
+            out.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256") && out.contains("X-Amz-Expires=60"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn unknown_dns_challenge_siblings_are_redacted() {
+        let r = redact_config(json!({"issuers": [{"challenges": {"dns": {
+            "provider": {"name": "cloudflare", "api_token": "t1"},
+            "ttl": "120s", "resolvers": ["1.1.1.1"], "propagation_timeout": "2m",
+            "mystery": "m1"
+        }}}]}));
+        let text = r.config.0.to_string();
+        assert!(!text.contains("t1") && !text.contains("m1"), "{text}");
+        assert!(
+            text.contains("120s") && text.contains("1.1.1.1") && text.contains("2m"),
+            "{text}"
+        );
+        assert!(text.contains("cloudflare"), "{text}");
+        assert!(
+            r.redacted
+                .contains(&"/issuers/0/challenges/dns/mystery".to_string()),
+            "{:?}",
+            r.redacted
+        );
+        assert!(
+            r.redacted
+                .contains(&"/issuers/0/challenges/dns/provider/api_token".to_string()),
+            "{:?}",
+            r.redacted
+        );
     }
 }

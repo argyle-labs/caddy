@@ -118,10 +118,10 @@ API references: [`GET/PUT/PATCH /config/[path]`](https://caddyserver.com/docs/ap
 No tool returns secrets. `caddy.config.get` and `caddy.config.export` replace with `<redacted>`:
 
 - every secret-shaped key (orca's shared scrub list: `password`, `token`, `secret`, `api_key`, ...), plus `connection_string`, `*dsn` and `*uri` keys (the `*uri` rule also hides harmless values such as a `redirect_uri`);
-- every value of `apps.tls.dns`, of a DNS challenge's `provider` (`issuers[*].challenges.dns.provider`) and of an ACME `external_account`, whatever its shape, keeping only a string `name` (or `key_id`). The challenge's own settings, such as `ttl`, stay visible;
+- every value of `apps.tls.dns`, of a DNS challenge's `provider` (`issuers[*].challenges.dns.provider`) and of an ACME `external_account`, whatever its shape, keeping only a string `name` (or `key_id`). Of a DNS challenge's own settings only `ttl`, `resolvers`, `override_domain`, `propagation_delay` and `propagation_timeout` stay visible; any other key is redacted;
 - in every whitespace-separated word of every string value:
   - in a URL (`scheme://...`), everything up to the last `@`, even when the `@` is in the path, so `postgres://u:pa/ss@db/x` becomes `postgres://<redacted>@db/x` and `https://example.com/a@b` over-redacts to `https://<redacted>@b`;
-  - in a URL, the value of every query parameter with a secret-shaped name (`?token=...`);
+  - the value of every query parameter whose percent-decoded name is secret-shaped (`?token=...`, `api%5Fkey=...`) or is `signature`, `sig`, `credential`, `X-Amz-Signature`, `X-Amz-Credential` or `X-Amz-Security-Token`, with or without a scheme;
   - without a scheme, everything up to the last `@` when that part contains `:` (`user:pass@host:6379`). A bare `token@host` with no colon and no scheme is not recognised, because it cannot be told apart from an email address.
 
   This covers, for example, a storage `connection_string`, a redis `address` and the `admin.config.load` URL. `caddy.route.list` applies the same rule to dial addresses.
