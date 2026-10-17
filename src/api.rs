@@ -4,6 +4,7 @@ use plugin_toolkit::api_client::ApiClientBuilder;
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::reqwest::{Client as HttpClient, RequestBuilder};
 use plugin_toolkit::serde_json::{self, Value};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 pub struct Caddy {
@@ -16,6 +17,23 @@ pub struct Caddy {
 pub struct Snapshot {
     pub config: Value,
     pub etag: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conflict {
+    pub op: String,
+}
+
+impl std::fmt::Display for Conflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: config changed concurrently (HTTP 412)", self.op)
+    }
+}
+
+impl std::error::Error for Conflict {}
+
+pub fn is_conflict(e: &plugin_toolkit::anyhow::Error) -> bool {
+    e.downcast_ref::<Conflict>().is_some()
 }
 
 impl Caddy {
@@ -33,6 +51,10 @@ impl Caddy {
             api_key,
             http: builder.build()?,
         })
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     fn url(&self, path: &str) -> String {
@@ -59,7 +81,7 @@ impl Caddy {
             .await
             .map_err(|e| anyhow!("{op}: {}", self.excerpt(&e.to_string())))?;
         if status == 412 {
-            bail!("{op}: config changed concurrently (HTTP 412); retry");
+            return Err(Conflict { op: op.to_string() }.into());
         }
         if !(200..300).contains(&status) {
             bail!("{op}: HTTP {status} {}", self.excerpt(&body));
@@ -158,28 +180,49 @@ pub fn check_segment(kind: &str, s: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn check_host(host: &str) -> Result<()> {
-    let bare = host.strip_prefix("*.").unwrap_or(host);
-    if bare.is_empty()
-        || host.len() > 253
-        || !bare
-            .split('.')
-            .all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
-    {
+fn valid_label(l: &str) -> bool {
+    !l.is_empty()
+        && l.len() <= 63
+        && !l.starts_with('-')
+        && !l.ends_with('-')
+        && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+fn valid_hostname(h: &str) -> bool {
+    h.len() <= 253 && h.split('.').all(valid_label)
+}
+
+pub fn normalize_host(host: &str) -> Result<String> {
+    if !host.is_ascii() {
+        bail!("invalid host {host:?}: use the punycode (xn--) form of internationalized names");
+    }
+    let lower = host.to_ascii_lowercase();
+    let bare = lower.strip_prefix("*.").unwrap_or(&lower);
+    if !valid_hostname(bare) {
         bail!("invalid host {host:?}");
     }
-    Ok(())
+    Ok(lower)
 }
 
 pub fn check_dial(dial: &str) -> Result<()> {
-    let Some((host, port)) = dial.rsplit_once(':') else {
-        bail!("invalid upstream {dial:?}: expected host:port");
+    let bad =
+        || anyhow!("invalid upstream {dial:?}: expected host:port, [ipv6]:port or unix//path");
+    if let Some(path) = dial.strip_prefix("unix//") {
+        if path.is_empty() || path.chars().any(|c| c.is_whitespace() || c == '{') {
+            return Err(bad());
+        }
+        return Ok(());
+    }
+    let (host, port) = dial.rsplit_once(':').ok_or_else(bad)?;
+    if port.parse::<u16>().map_or(true, |p| p == 0) {
+        return Err(bad());
+    }
+    let ok = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(v6) => v6.parse::<Ipv6Addr>().is_ok(),
+        None => host.parse::<Ipv4Addr>().is_ok() || valid_hostname(host),
     };
-    if host.is_empty()
-        || host.chars().any(|c| c.is_whitespace() || c == '/')
-        || port.parse::<u16>().map_or(true, |p| p == 0)
-    {
-        bail!("invalid upstream {dial:?}: expected host:port");
+    if !ok {
+        return Err(bad());
     }
     Ok(())
 }

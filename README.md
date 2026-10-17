@@ -75,91 +75,128 @@ Back up the config/data volume(s) above — that's the whole service state (stop
 
 ## With orca
 
-A translation layer over Caddy's official [admin API](https://caddyserver.com/docs/api). Register a running instance as an endpoint whose `routes` point at the admin API (default `localhost:2019`; see [Reaching the admin API](#reaching-the-admin-api)), then drive it:
+A translation layer over Caddy's official [admin API](https://caddyserver.com/docs/api). Register a running instance as an endpoint whose `routes` point at the admin API (see [Reaching the admin API](#reaching-the-admin-api)), then drive it:
 
 ```sh
-orca caddy.create --name edge --route lan=http://10.0.0.5:2019 --enabled true
+orca caddy.create --name edge --route lan=http://localhost:2019 --enabled true
 orca caddy.status        --name edge
 orca caddy.route.list    --name edge
 orca caddy.route.set     --name edge --host orca.example.com --upstream 10.0.0.6:12000
 orca caddy.route.set     --name edge --host app.example.com --upstream 10.0.0.9:8080,10.0.0.10:8080
 orca caddy.route.delete  --name edge --host app.example.com
-orca caddy.tls.ensure    --name edge --host app.example.com
-orca caddy.config.get    --name edge                 # secret-shaped fields redacted
-orca caddy.config.export --name edge > caddy.json    # lossless
+orca caddy.tls.ensure    --name edge --host cert-only.example.com
+orca caddy.config.get    --name edge
+orca caddy.config.export --name edge
 orca caddy.config.persist --name edge
 orca caddy.reload        --name edge
 ```
 
-Writes run by default; pass `dryRun=true` to preview. Reads need `read`, writes and `config.export` need `admin`. Every write reads `GET /config/` first and sends its `Etag` back as `If-Match`, so a concurrent change fails with HTTP 412 instead of being overwritten ([concurrent config changes](https://caddyserver.com/docs/api#concurrent-config-changes)).
+Writes run by default. With `dryRun=true` they still read the live config and return the same report (actions, route index, TLS decision, and a `changes` list of JSON-pointer before/after values) without writing anything. Reads need `read` and writes need `admin`.
+
+Every write is planned from one `GET /config/` snapshot and applied as one `PATCH /config/apps` (or `/config/admin` for `config.persist`) carrying that snapshot's `Etag` as `If-Match`. If the config changed in between, Caddy answers HTTP 412 ([concurrent config changes](https://caddyserver.com/docs/api#concurrent-config-changes)), and the verb re-reads and re-plans, up to 3 attempts. Writes that change nothing are skipped. Every report warns when `admin.config.load` is set, because a config loader can replace admin-API changes ([`admin.config.load`](https://caddyserver.com/docs/json/admin/config/load/)).
 
 | Tool | Role | Admin API |
 |---|---|---|
-| `caddy.status` | read | `GET /config/`, `GET /reverse_proxy/upstreams` |
-| `caddy.config.get` | read | `GET /config/`, secret-shaped keys redacted |
-| `caddy.config.export` | admin | `GET /config/`, unredacted |
+| `caddy.list` / `caddy.detail` | read | orca endpoint registry |
+| `caddy.create` / `caddy.update` / `caddy.delete` | admin | orca endpoint registry |
+| `caddy.status` | read | `GET /config/`, `GET /reverse_proxy/upstreams` (failure reason in `upstreams_error`) |
+| `caddy.config.get` | read | `GET /config/`, redacted |
+| `caddy.config.export` | read | `GET /config/`, redacted, with the JSON pointer of each redacted value |
 | `caddy.route.list` | read | `GET /config/` |
-| `caddy.route.set` | admin | `caddy.tls.ensure`, then `PATCH /config/apps/http/servers/<server>/routes` (`PUT` when the server has no `routes` yet) |
-| `caddy.route.delete` | admin | `PATCH /config/apps/http/servers/<server>/routes` |
-| `caddy.tls.ensure` | admin | `PATCH /config/apps/tls/automation/policies/<i>/subjects` |
-| `caddy.config.persist` | admin | `PATCH /config/admin/config/persist` |
-| `caddy.reload` | admin | `POST /load` with `Cache-Control: must-revalidate` |
+| `caddy.route.set` | admin | `GET /config/`, `PATCH /config/apps` |
+| `caddy.route.delete` | admin | `GET /config/`, `PATCH /config/apps` |
+| `caddy.tls.ensure` | admin | `GET /config/`, `PATCH /config/apps` |
+| `caddy.config.persist` | admin | `GET /config/`, `PATCH /config/admin` |
+| `caddy.reload` | admin | `GET /config/`, `POST /load` with `Cache-Control: must-revalidate` |
 
-API references: [`GET/PUT/PATCH /config/[path]`](https://caddyserver.com/docs/api#get-configpath), [`POST /load`](https://caddyserver.com/docs/api#post-load), [`GET /reverse_proxy/upstreams`](https://caddyserver.com/docs/api#get-reverse-proxyupstreams), [TLS automation policies](https://caddyserver.com/docs/json/apps/tls/automation/policies/), [`admin.config.persist`](https://caddyserver.com/docs/json/admin/config/persist/).
+API references: [`GET/PUT/PATCH /config/[path]`](https://caddyserver.com/docs/api#get-configpath), [`POST /load`](https://caddyserver.com/docs/api#post-load), [`GET /reverse_proxy/upstreams`](https://caddyserver.com/docs/api#get-reverse-proxyupstreams), [TLS automation policies](https://caddyserver.com/docs/json/apps/tls/automation/policies/), [`apps.tls.certificates.automate`](https://caddyserver.com/docs/json/apps/tls/certificates/automate/), [`admin.config.persist`](https://caddyserver.com/docs/json/admin/config/persist/).
 
 `api_key` is optional and stored as the orca secret `caddy.<endpoint>.api_key`. Caddy's admin API has no bearer auth of its own; the key is sent as `Authorization: Bearer` for an authenticating proxy in front of it.
 
+### Redaction
+
+No tool returns secrets. `caddy.config.get` and `caddy.config.export` replace with `<redacted>`:
+
+- every secret-shaped key (orca's shared scrub list: `password`, `token`, `secret`, `api_key`, ...);
+- every setting of a DNS provider module except its `name` (`issuers[*].challenges.dns.provider`, `apps.tls.dns`);
+- every ACME external-account setting except `key_id`.
+
+`caddy.config.export` also lists the JSON pointer of every redacted value. The export is for review and diffing, not restore. The restorable copy is Caddy's own `autosave.json`: `service.backup` covers it through the `/config` data path for the container image; a native install keeps it under the service user's home (`/var/lib/caddy/.config/caddy/` for the Debian package), which the backup must include.
+
+### Hosts and upstreams
+
+- Hosts are lowercased before writing. Labels are 1-63 characters of `a-z`, `0-9` and `-`, and do not start or end with `-`. Internationalized names must be given in punycode (`xn--...`).
+- `*.example.com` is a [host matcher](https://caddyserver.com/docs/json/apps/http/servers/routes/match/host/) wildcard: it matches exactly one label (`a.example.com`, not `example.com` or `a.b.example.com`). The same rule decides TLS subject coverage.
+- Upstreams are `host:port`, `[ipv6]:port` or `unix//path`. Placeholders and URLs are refused.
+- The plugin refuses to point a route at this Caddy's admin API (`admin.listen`, default `localhost:2019`, or the endpoint's own address). It also refuses to change or delete the route for the hostname the endpoint reaches the admin API through, so orca cannot cut off its own access.
+
 ### Routes
 
-`caddy.route.set` is idempotent and writes nothing when the route is already right.
+A route counts as a host's route only when every matcher set in it is exactly `{"host": [...]}` and lists the host.
 
-- An existing reverse-proxy route for the host has its upstreams replaced, including Caddyfile-style routes whose `reverse_proxy` sits inside a `subroute`.
-- It refuses a route that also serves other hosts, or one with more than one `reverse_proxy` handler, rather than changing them all.
-- A new host gets `{"match":[{"host":[host]}],"handle":[{"handler":"reverse_proxy",...}],"terminal":true}`, inserted ahead of the first route that would otherwise match it (a wildcard host such as `*.example.com`, or a route without a host matcher).
-
-`caddy.route.delete` removes a route that serves only that host. From a route shared with other hosts it removes just the host, never leaving a matcher broader than before.
+- `caddy.route.set` replaces the upstreams of that route's single `reverse_proxy`, including one inside a Caddyfile-style `subroute`. It writes nothing when they already match.
+- It refuses, and writes nothing (TLS included), when the host's route:
+  - also has path, method, header or other conditions;
+  - also serves other hosts;
+  - has more than one `reverse_proxy`, or none;
+  - is one of several routes for the host;
+  - is matched inside a subroute, for example a `@name host ...` matcher in a wildcard site block.
+- A new host gets `{"match":[{"host":[host]}],"handle":[{"handler":"reverse_proxy",...}],"terminal":true}`. It is inserted before the first route that could match the host. That is deliberately conservative: a route without matchers, a matcher set without a `host` condition (even one restricted by path), or a host pattern matching the host all count, so the new route may land earlier than strictly needed, but never behind a route that would catch it.
+- `caddy.route.delete` removes a route that serves only that host. From a route shared with other hosts it removes just the host, and drops a matcher set whose host list becomes empty instead of leaving a broader matcher.
+- `caddy.route.list` reports hosts matched inside subroutes with `nested: true`.
 
 ### TLS
 
-Caddy picks the first [automation policy](https://caddyserver.com/docs/json/apps/tls/automation/policies/) whose `subjects` match a name; a policy without `subjects` matches every name. `caddy.tls.ensure`, and `caddy.route.set` before it writes the route:
+Caddy uses the first [automation policy](https://caddyserver.com/docs/json/apps/tls/automation/policies/) whose `subjects` match a name; a policy without `subjects` matches every name. For the host, `caddy.route.set` (and `caddy.tls.ensure`):
 
-1. Leaves the host alone if a catch-all policy or a matching subject covers it. A subject `*.example.com` matches exactly one label.
-2. Otherwise adds the host to the `subjects` of the DNS-01 policy (an issuer with `challenges.dns`) sharing the longest domain suffix with it. Other policies are untouched.
-3. Writes nothing when there is no DNS-01 policy. Caddy's default issuers (HTTP-01 / TLS-ALPN-01) then apply, which need the host to be publicly reachable.
+1. Reports the covering policy and its challenge type (`dns01`, `http_or_tls_alpn` or `internal`), with a warning when it is not DNS-01.
+2. Otherwise adds the host to the `subjects` of a DNS-01 policy (an issuer with `challenges.dns`) whose subjects share at least the last two labels with it, preferring the longest shared suffix. orca has no public-suffix list, so under multi-label public suffixes such as `co.uk` two unrelated domains can qualify.
+3. Otherwise writes nothing and warns: Caddy's default issuers (HTTP-01 / TLS-ALPN-01) apply, which need the host to be publicly reachable.
 
-Certificates loaded through `apps.tls.certificates` are not considered.
+A route's host gets a certificate through automatic HTTPS. `caddy.tls.ensure` is for a host with no route: after the steps above it also adds the host to `apps.tls.certificates.automate` so Caddy obtains and renews the certificate anyway. Certificates loaded from files are not considered.
 
 ### Running from JSON so admin-API changes survive restarts
 
-Admin-API changes apply live and Caddy autosaves the active config to `autosave.json` in its [config directory](https://caddyserver.com/docs/conventions#configuration-directory) (`admin.config.persist`, default `true`). A Caddy started with `--config Caddyfile` ignores that file and reloads the Caddyfile on every restart or `caddy reload`, discarding everything orca wrote. Convert once, on the Caddy host:
+Admin-API changes apply live, and Caddy autosaves the active config to `autosave.json` in its [config directory](https://caddyserver.com/docs/conventions#configuration-directory) (`admin.config.persist`, default `true`). A Caddy started with `--config Caddyfile` ignores that file and reloads the Caddyfile on every restart or `caddy reload`, discarding everything orca wrote. Convert once, on the Caddy host (systemd, Debian package):
 
 ```sh
-# 1. Render the Caddyfile to JSON and check it.
+# 1. Back up, then render the Caddyfile to JSON and check it.
+cp -a /etc/caddy/Caddyfile /etc/caddy/Caddyfile.pre-json
 caddy adapt --config /etc/caddy/Caddyfile --pretty > /etc/caddy/caddy.json
 caddy validate --config /etc/caddy/caddy.json
 
-# 2. Load it through the admin API (this also writes autosave.json).
+# 2. Load it through the admin API, then confirm the autosave exists and matches.
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data-binary @/etc/caddy/caddy.json http://localhost:2019/load
+AUTOSAVE=/var/lib/caddy/.config/caddy/autosave.json
+test -s "$AUTOSAVE" && caddy validate --config "$AUTOSAVE"
 
-# 3. Start from the autosave from now on. The packaged caddy-api unit runs
-#    `caddy run --environ --resume`.
+# 3. Run from the autosave, without --environ.
+systemctl edit caddy-api
+#   [Service]
+#   EnvironmentFile=/etc/caddy/caddy.env
+#   ExecStart=
+#   ExecStart=/usr/bin/caddy run --resume
 systemctl disable --now caddy
 systemctl enable --now caddy-api
+curl -fsS http://localhost:2019/config/ >/dev/null && orca caddy.status --name <endpoint>
 ```
 
-- [`caddy adapt`](https://caddyserver.com/docs/command-line#caddy-adapt) and [`caddy validate`](https://caddyserver.com/docs/command-line#caddy-validate) do not touch the running server.
-- [`caddy run --resume`](https://caddyserver.com/docs/command-line#caddy-run) starts from the last autosaved config. The `caddy-api` unit is described in [Linux service](https://caddyserver.com/docs/running#linux-service).
-- Placeholders such as `{env.CF_API_TOKEN}` survive `adapt`, so give `caddy-api` the same environment file as `caddy` (`systemctl edit caddy-api`, `EnvironmentFile=`).
-- In Docker, run `caddy run --resume` and keep `/config` on a volume. That is where `autosave.json` lives.
-- After the switch, do not run `caddy reload --config Caddyfile`. Change routes through orca, and keep `orca caddy.config.export` output as the off-box copy. `caddy.config.persist` sets `admin.config.persist` back to `true` if it was turned off.
+- **Rollback:** `systemctl disable --now caddy-api && systemctl enable --now caddy` brings back the Caddyfile service from `/etc/caddy/Caddyfile` (unchanged; the copy is `Caddyfile.pre-json`). Anything orca wrote since the switch is then gone; record it first with `orca caddy.route.list` if you need to re-apply it.
+- [`caddy adapt`](https://caddyserver.com/docs/command-line#caddy-adapt) and [`caddy validate`](https://caddyserver.com/docs/command-line#caddy-validate) do not touch the running server. [`caddy run --resume`](https://caddyserver.com/docs/command-line#caddy-run) starts from the last autosave. The packaged `caddy-api` unit is described in [Linux service](https://caddyserver.com/docs/running#linux-service).
+- The `ExecStart` override drops `--environ`, which prints the whole environment (including `CF_API_TOKEN`) to the journal at startup. Placeholders such as `{env.CF_API_TOKEN}` survive `adapt` and still resolve from the `EnvironmentFile` (mode `0600`, owned by root).
+- The autosave path follows the service user's home; check it with `systemctl show caddy-api -p User` and `caddy environ` run as that user.
+- **Docker:** set the container command to `caddy run --resume`, keep `/config` (which holds `caddy/autosave.json`) and `/data` on volumes, and pass `CF_API_TOKEN` through `environment:`/an env file. Seed it once with the same `caddy adapt` + `POST /load`, and check `docker exec caddy test -s /config/caddy/autosave.json` before relying on restarts. Rollback is restoring the previous command and Caddyfile mount.
+- After the switch, do not run `caddy reload --config Caddyfile`. `caddy.config.persist` turns `admin.config.persist` back on if it was set to `false`.
 
 ### Reaching the admin API
 
-The admin endpoint listens on `localhost:2019` by default. Anyone who can reach it can rewrite the server, so it must not be opened to the network without access control ([admin](https://caddyserver.com/docs/json/admin/)). The options:
+The admin endpoint listens on `localhost:2019` by default. Anyone who can reach it can rewrite the server, so it must not be opened to the network without access control ([admin](https://caddyserver.com/docs/json/admin/)).
 
-1. **An orca member on the Caddy host (recommended).** Run orca on the Caddy host and register the endpoint with `--route lan=http://localhost:2019`, so the plugin's HTTP goes from that member to its own loopback. The admin API stays loopback-only and needs no new listener or credential, and access goes through orca's roles.
-2. **Loopback admin behind an authenticating site.** Keep `admin localhost:2019`, and add a LAN-bound Caddy site that requires the Hydra forward-auth or a bearer token and `reverse_proxy`s to `localhost:2019` with `header_up Host localhost:2019`. Without that header, the admin endpoint's Host/Origin check rejects the request. Store the token as `caddy.<endpoint>.api_key`. This site lives in the same config orca edits, so a bad write can cut off orca's own access.
+The plugin's HTTP requests are executed by the orca daemon that runs the plugin process, through its `http.request` capability. They go out from that daemon's host, not from wherever the CLI or MCP client is. A route of `http://localhost:2019` therefore means "the Caddy on the host where this tool call runs".
+
+1. **An orca member on the Caddy host (recommended).** Install orca and the caddy plugin on the Caddy host (CT104), register the endpoint there with `--route lan=http://localhost:2019`, and address every `caddy.*` call to that system's id so orca dispatches it to that member. The admin API stays loopback-only, and needs no new listener or credential. Called on any other system (for example the hub), the same endpoint would talk to that system's own loopback, so never register a `localhost` route on a system that is not the Caddy host.
+2. **Loopback admin behind an authenticating HTTPS site.** Keep `admin localhost:2019` and add a LAN-only `https://caddy-admin.<domain>` site that requires the Hydra forward-auth or a bearer token and `reverse_proxy`s to `localhost:2019` with `header_up Host localhost:2019`. Without that header, the admin endpoint's Host/Origin check rejects the request. Register `--route lan=https://caddy-admin.<domain>` and store the token as `caddy.<endpoint>.api_key`. The plugin refuses to change that site's route, but a hand edit or a `POST /load` can still cut off access.
 3. **`admin.listen` on a LAN address with `origins`.** Avoid. [`origins` / `enforce_origin`](https://caddyserver.com/docs/json/admin/origins/) protect against DNS rebinding and are not authentication: every host on the LAN gets full control.
 4. **Remote admin (`admin.remote`).** Authenticates clients by mTLS public key with per-path permissions ([remote](https://caddyserver.com/docs/json/admin/remote/)). It needs a client certificate on every request, and the plugin's delegated HTTP sends none.
 
@@ -168,7 +205,8 @@ The admin endpoint listens on `localhost:2019` by default. Anyone who can reach 
 - `src/lib.rs` — the `ServiceBackend` and the `#[endpoint_resource]` registry.
 - `src/api.rs` — the admin-API client.
 - `src/routes.rs` — route list/upsert/delete over the config JSON.
-- `src/tls.rs` — automation-policy coverage and the subject to add.
+- `src/tls.rs` — automation-policy coverage, the subject to add, and the change records.
+- `src/redact.rs` — config redaction.
 - `src/tools.rs` — the `caddy.*` tools.
 - `src/main.rs` — the `Plugin` builder entrypoint (dual facet: service + tools).
 - `docs/` — standalone operator notes.
