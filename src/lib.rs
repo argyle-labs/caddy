@@ -263,13 +263,13 @@ mod tests {
     }
 
     #[test]
-    fn load_forces_a_reload() {
+    fn replace_forces_a_guarded_reload() {
         let calls = serve(
             |_, _| Some((200, vec![], String::new())),
-            || block(c().load(&sample(), Some("\"/config/ abc\""))).unwrap(),
+            || block(c().replace(&sample(), Some("\"/config/ abc\""))).unwrap(),
         );
         assert_eq!(calls[0].method, "POST");
-        assert_eq!(calls[0].path, "load");
+        assert_eq!(calls[0].path, "config/");
         assert!(
             calls[0].headers.contains("if-match"),
             "{}",
@@ -444,7 +444,8 @@ mod tests {
                 let tag = format!("\"/config/ {:x}\"", cfg.to_string().len());
                 match (method, path) {
                     ("GET", "config/") => Some((200, etag(&tag), cfg.to_string())),
-                    ("PATCH", _) | ("PUT", _) | ("POST", "load") => {
+                    ("POST", "load") => Some((200, vec![], String::new())),
+                    (_, p) if p.starts_with("config/") => {
                         let mut left = conflicts.lock().unwrap();
                         if *left > 0 {
                             *left -= 1;
@@ -465,6 +466,10 @@ mod tests {
                 .filter(|c| c.method != "GET" && c.path != "load")
             {
                 let key = call.path.trim_start_matches("config/").to_string();
+                if key.is_empty() {
+                    *cfg = call.body.clone();
+                    continue;
+                }
                 cfg[key] = call.body.clone();
             }
             calls
@@ -727,10 +732,13 @@ mod tests {
         let calls = fake.serve(|| {
             assert!(block(tools::reload(&c(), false)).unwrap().reloaded);
         });
-        let loads: Vec<&Call> = calls.iter().filter(|c| c.path == "load").collect();
-        assert_eq!(loads.len(), 2, "{calls:?}");
-        assert!(loads.iter().all(|c| c.headers.contains("if-match")));
-        assert_eq!(calls.iter().filter(|c| c.path == "config/").count(), 2);
+        let posts: Vec<&Call> = calls.iter().filter(|c| c.method == "POST").collect();
+        assert_eq!(posts.len(), 2, "{calls:?}");
+        assert!(posts.iter().all(|c| c.path == "config/"
+            && c.headers.contains("if-match")
+            && c.headers.contains("must-revalidate")
+            && c.body == live()));
+        assert!(calls.iter().all(|c| c.path != "load"));
 
         let fake = Fake::new(live(), tools::MAX_ATTEMPTS);
         fake.serve(|| {

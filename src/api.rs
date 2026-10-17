@@ -112,17 +112,17 @@ impl Caddy {
         Ok(Snapshot { config, etag })
     }
 
-    pub async fn load(&self, config: &Value, etag: Option<&str>) -> Result<()> {
+    pub async fn replace(&self, config: &Value, etag: Option<&str>) -> Result<()> {
         let req = self
             .http
-            .post(self.url("load"))
+            .post(self.config_url(""))
             .header(
                 "cache-control",
                 plugin_toolkit::reqwest::header::HeaderValue::from_static("must-revalidate"),
             )
             .json(config);
         let req = Self::if_match(req, etag)?;
-        self.send(req, "POST /load").await.map(drop)
+        self.send(req, "POST /config/").await.map(drop)
     }
 
     pub async fn patch(&self, path: &str, value: &Value, etag: Option<&str>) -> Result<()> {

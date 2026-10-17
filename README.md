@@ -91,7 +91,7 @@ orca caddy.config.persist --name edge
 orca caddy.reload        --name edge
 ```
 
-Writes run by default. When the call runs on the system that hosts the plugin, `dryRun=true` they still read the live config and return the same report (actions, route index, TLS decision, and a `changes` list of JSON-pointer before/after values) without writing anything. orca currently refuses `dryRun` on calls addressed to another system's id unless the tool is execute-gated, and these writes are dry-run aware instead; with option 1 below, run the dry run on the Caddy host's orca directly. Reads need `read` and writes need `admin`.
+Writes run by default. When the call runs on the system that hosts the plugin, `dryRun=true` still reads the live config and returns the same report (actions, route index, TLS decision, and a `changes` list of JSON-pointer before/after values) without writing anything. orca currently refuses `dryRun` on a call addressed to another system's id unless the tool is execute-gated, and these writes are dry-run aware rather than execute-gated. With option 1 below, run dry runs on the Caddy host's orca directly. Reads need `read` and writes need `admin`.
 
 Every write is planned from one `GET /config/` snapshot and applied as one `PATCH /config/apps` (or `/config/admin` for `config.persist`) carrying that snapshot's `Etag` as `If-Match`. If `GET /config/` returns no `Etag`, the write is refused rather than sent unguarded. If the config changed in between, Caddy answers HTTP 412 ([concurrent config changes](https://caddyserver.com/docs/api#concurrent-config-changes)), and the verb re-reads and re-plans, up to 3 attempts. Writes that change nothing are skipped. Every report warns when `admin.config.load` is set, because a config loader can replace admin-API changes ([`admin.config.load`](https://caddyserver.com/docs/json/admin/config/load/)).
 
@@ -107,9 +107,9 @@ Every write is planned from one `GET /config/` snapshot and applied as one `PATC
 | `caddy.route.delete` | admin | `GET /config/`, `PATCH /config/apps` |
 | `caddy.tls.ensure` | admin | `GET /config/`, `PATCH /config/apps` |
 | `caddy.config.persist` | admin | `GET /config/`, `PATCH /config/admin` |
-| `caddy.reload` | admin | `GET /config/`, `POST /load` with `Cache-Control: must-revalidate` and `If-Match` |
+| `caddy.reload` | admin | `GET /config/`, then `POST /config/` with the same body, `Cache-Control: must-revalidate` and `If-Match` |
 
-API references: [`GET/PUT/PATCH /config/[path]`](https://caddyserver.com/docs/api#get-configpath), [`POST /load`](https://caddyserver.com/docs/api#post-load), [`GET /reverse_proxy/upstreams`](https://caddyserver.com/docs/api#get-reverse-proxyupstreams), [TLS automation policies](https://caddyserver.com/docs/json/apps/tls/automation/policies/), [`apps.tls.certificates.automate`](https://caddyserver.com/docs/json/apps/tls/certificates/automate/), [`admin.config.persist`](https://caddyserver.com/docs/json/admin/config/persist/).
+API references: [`GET/PUT/PATCH /config/[path]`](https://caddyserver.com/docs/api#get-configpath), [`GET /reverse_proxy/upstreams`](https://caddyserver.com/docs/api#get-reverse-proxyupstreams), [TLS automation policies](https://caddyserver.com/docs/json/apps/tls/automation/policies/), [`apps.tls.certificates.automate`](https://caddyserver.com/docs/json/apps/tls/certificates/automate/), [`admin.config.persist`](https://caddyserver.com/docs/json/admin/config/persist/).
 
 `api_key` is optional and stored as the orca secret `caddy.<endpoint>.api_key`. Caddy's admin API has no bearer auth of its own; the key is sent as `Authorization: Bearer` for an authenticating proxy in front of it.
 
@@ -117,9 +117,14 @@ API references: [`GET/PUT/PATCH /config/[path]`](https://caddyserver.com/docs/ap
 
 No tool returns secrets. `caddy.config.get` and `caddy.config.export` replace with `<redacted>`:
 
-- every secret-shaped key (orca's shared scrub list: `password`, `token`, `secret`, `api_key`, ...), plus `connection_string`, `*dsn` and `*uri` keys;
-- every value of a DNS provider module (`issuers[*].challenges.dns.provider`, `apps.tls.dns`) and of an ACME `external_account`, whatever its shape, keeping only a string `name` (or `key_id`);
-- the `user:password@` part of any URL or `user:password@host` string, anywhere in the config (for example a storage `connection_string`, a redis `address`, or the `admin.config.load` URL). `caddy.route.list` strips it from dial addresses too.
+- every secret-shaped key (orca's shared scrub list: `password`, `token`, `secret`, `api_key`, ...), plus `connection_string`, `*dsn` and `*uri` keys (the `*uri` rule also hides harmless values such as a `redirect_uri`);
+- every value of `apps.tls.dns`, of a DNS challenge's `provider` (`issuers[*].challenges.dns.provider`) and of an ACME `external_account`, whatever its shape, keeping only a string `name` (or `key_id`). The challenge's own settings, such as `ttl`, stay visible;
+- in every whitespace-separated word of every string value:
+  - in a URL (`scheme://...`), everything up to the last `@`, even when the `@` is in the path, so `postgres://u:pa/ss@db/x` becomes `postgres://<redacted>@db/x` and `https://example.com/a@b` over-redacts to `https://<redacted>@b`;
+  - in a URL, the value of every query parameter with a secret-shaped name (`?token=...`);
+  - without a scheme, everything up to the last `@` when that part contains `:` (`user:pass@host:6379`). A bare `token@host` with no colon and no scheme is not recognised, because it cannot be told apart from an email address.
+
+  This covers, for example, a storage `connection_string`, a redis `address` and the `admin.config.load` URL. `caddy.route.list` applies the same rule to dial addresses.
 
 `caddy.config.export` also lists the JSON pointer of every redacted value. The export is for review and diffing, not restore. The restorable copy is Caddy's own `autosave.json`: `service.backup` covers it through the `/config` data path for the container image; a native install keeps it under the service user's home (`/var/lib/caddy/.config/caddy/` for the Debian package), which the backup must include.
 

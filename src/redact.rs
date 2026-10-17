@@ -33,24 +33,59 @@ fn sensitive(key: &str) -> bool {
         || n.ends_with("uri")
 }
 
-pub fn strip_userinfo(s: &str) -> Option<String> {
-    if s.chars().any(char::is_whitespace) {
-        return None;
-    }
-    let (scheme, rest) = match s.split_once("://") {
-        Some((scheme, rest)) => (Some(scheme), rest),
-        None => (None, s),
+fn redact_query(tail: &str) -> String {
+    let Some((before, query)) = tail.split_once('?') else {
+        return tail.to_string();
     };
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(end);
-    let (userinfo, host) = authority.rsplit_once('@')?;
-    if host.is_empty() || (scheme.is_none() && !userinfo.contains(':')) {
-        return None;
+    let (query, fragment) = match query.split_once('#') {
+        Some((q, f)) => (q, Some(f)),
+        None => (query, None),
+    };
+    let query: Vec<String> = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((k, _)) if is_sensitive_key(k) => format!("{k}={REDACTED}"),
+            _ => pair.to_string(),
+        })
+        .collect();
+    let mut out = format!("{before}?{}", query.join("&"));
+    if let Some(f) = fragment {
+        out.push('#');
+        out.push_str(f);
     }
-    Some(match scheme {
-        Some(scheme) => format!("{scheme}://{REDACTED}@{host}{tail}"),
-        None => format!("{REDACTED}@{host}{tail}"),
-    })
+    out
+}
+
+fn clean_token(token: &str) -> String {
+    match token.split_once("://") {
+        Some((scheme, rest)) => {
+            let rest = match rest.rsplit_once('@') {
+                Some((_, after)) => format!("{REDACTED}@{after}"),
+                None => rest.to_string(),
+            };
+            format!("{scheme}://{}", redact_query(&rest))
+        }
+        None => match token.rsplit_once('@') {
+            Some((userinfo, after)) if userinfo.contains(':') => format!("{REDACTED}@{after}"),
+            _ => token.to_string(),
+        },
+    }
+}
+
+pub fn strip_userinfo(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len());
+    let mut token = String::new();
+    for c in s.chars() {
+        if c.is_whitespace() {
+            out.push_str(&clean_token(&token));
+            token.clear();
+            out.push(c);
+        } else {
+            token.push(c);
+        }
+    }
+    out.push_str(&clean_token(&token));
+    (out != s).then_some(out)
 }
 
 fn walk(value: &mut Value, path: &str, out: &mut Vec<String>) {
@@ -69,7 +104,7 @@ fn walk(value: &mut Value, path: &str, out: &mut Vec<String>) {
                     out.push(here);
                 } else if let Some((_, keep)) = WHOLESALE
                     .iter()
-                    .find(|(key, _)| key == k && !(k == "dns" && v.get("provider").is_some()))
+                    .find(|(key, _)| key == k && !(k == "dns" && path.ends_with("/challenges")))
                 {
                     if let Some(module) = v.as_object_mut() {
                         for (mk, mv) in module
@@ -156,14 +191,14 @@ mod tests {
             "admin": {"config": {"load": {"module": "http", "url": "https://ops:hunter2@cfg.example.com/caddy.json"}}},
             "storage": {"module": "postgres", "connection_string": "postgres://caddy:pgpass@db:5432/caddy"},
             "apps": {"x": {"address": "redis://:redispass@10.0.0.5:6379/0", "plain": "user:pw@10.0.0.9:6379",
-                           "email": "ops@example.com", "site": "https://example.com/a@b", "database_uri": "u"}}
+                           "email": "ops@example.com", "site": "https://example.com/a", "database_uri": "u"}}
         }));
         let text = r.config.0.to_string();
         for leaked in ["hunter2", "pgpass", "redispass", ":pw@"] {
             assert!(!text.contains(leaked), "{leaked} in {text}");
         }
         assert!(
-            text.contains("ops@example.com") && text.contains("https://example.com/a@b"),
+            text.contains("ops@example.com") && text.contains("\"https://example.com/a\""),
             "{text}"
         );
         assert!(
@@ -194,5 +229,63 @@ mod tests {
             assert!(!text.contains(leaked), "{leaked} in {text}");
         }
         assert!(text.contains("cloudflare"), "{text}");
+    }
+
+    #[test]
+    fn userinfo_is_over_redacted_when_ambiguous() {
+        assert_eq!(
+            strip_userinfo("postgres://u:pa/ss@db/x").unwrap(),
+            "postgres://<redacted>@db/x"
+        );
+        assert_eq!(
+            strip_userinfo("u:p#w@host:6379").unwrap(),
+            "<redacted>@host:6379"
+        );
+        assert_eq!(
+            strip_userinfo("https://example.com/a@b").unwrap(),
+            "https://<redacted>@b"
+        );
+        assert!(strip_userinfo("ops@example.com").is_none());
+        assert!(strip_userinfo("https://example.com/x").is_none());
+    }
+
+    #[test]
+    fn tokens_inside_free_text_are_cleaned() {
+        assert_eq!(
+            strip_userinfo("redis://:pw@10.0.0.5:6379 ").unwrap(),
+            "redis://<redacted>@10.0.0.5:6379 "
+        );
+        assert_eq!(
+            strip_userinfo("fetch https://a:b@cfg.example.com/x then retry").unwrap(),
+            "fetch https://<redacted>@cfg.example.com/x then retry"
+        );
+    }
+
+    #[test]
+    fn secret_query_params_are_redacted() {
+        assert_eq!(
+            strip_userinfo("https://cfg.example.com/c.json?token=abc&v=2#top").unwrap(),
+            "https://cfg.example.com/c.json?token=<redacted>&v=2#top"
+        );
+        assert!(strip_userinfo("https://cfg.example.com/c.json?v=2").is_none());
+    }
+
+    #[test]
+    fn only_challenge_dns_objects_keep_their_shape() {
+        let r = redact_config(json!({"apps": {"tls": {
+            "dns": {"name": "cloudflare", "provider": {"name": "x", "api_token": "t1"}, "zone": "z1"},
+            "automation": {"policies": [{"issuers": [{"challenges": {"dns": {
+                "provider": {"name": "cloudflare", "api_token": "t2"}, "ttl": "120s"}}}]}]}
+        }}}));
+        let text = r.config.0.to_string();
+        for leaked in ["t1", "t2", "z1"] {
+            assert!(!text.contains(leaked), "{leaked} in {text}");
+        }
+        assert!(
+            r.redacted.contains(&"/apps/tls/dns/provider".to_string()),
+            "{:?}",
+            r.redacted
+        );
+        assert!(text.contains("120s"), "{text}");
     }
 }

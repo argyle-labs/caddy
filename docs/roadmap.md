@@ -12,7 +12,7 @@ Shipped (operational surface, driving the JSON config over the admin API):
   idempotent upsert. Adding a service is one orca call, not a hand-edited
   Caddyfile. Edits are surgical (`PATCH .../routes`).
 - **Read config** — `caddy.config.get` (`GET /config/`).
-- **Reload** — `caddy.reload` re-applies the running config (`POST /load`).
+- **Reload** — `caddy.reload` re-applies the running config (`POST /config/` with `If-Match` and `Cache-Control: must-revalidate`).
 - **Status** — `caddy.status` (server/route/upstream counts).
 - **TLS coverage** — `caddy.tls.ensure`, run by `caddy.route.set`.
 - **Export / persist** — `caddy.config.export`, `caddy.config.persist`.

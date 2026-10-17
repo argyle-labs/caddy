@@ -603,7 +603,7 @@ pub async fn reload(c: &Caddy, dry_run: bool) -> Result<ReloadReport> {
         attempt += 1;
         let snap = c.config().await?;
         if !dry_run {
-            match c.load(&snap.config, Some(require_etag(&snap)?)).await {
+            match c.replace(&snap.config, Some(require_etag(&snap)?)).await {
                 Ok(()) => {}
                 Err(e) if is_conflict(&e) && attempt < MAX_ATTEMPTS => continue,
                 Err(e) => return Err(e),
@@ -617,9 +617,10 @@ pub async fn reload(c: &Caddy, dry_run: bool) -> Result<ReloadReport> {
     }
 }
 
-/// Reload the running config unchanged (`GET /config/`, then `POST /load` with
-/// `Cache-Control: must-revalidate` and `If-Match`, re-read on HTTP 412 up to
-/// three times). `dryRun` only reads.
+/// Reload the running config unchanged: `GET /config/`, then `POST /config/`
+/// with the same body, `Cache-Control: must-revalidate` and `If-Match`
+/// (`POST /load` ignores `If-Match`), re-read on HTTP 412 up to three times.
+/// `dryRun` only reads.
 #[orca_tool(
     domain = "caddy",
     verb = "reload",

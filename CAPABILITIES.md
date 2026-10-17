@@ -22,7 +22,7 @@ One binary registers **two facets** on the `Plugin` builder: a `ServiceBackend`
 - [x] `caddy.route.set` (admin) — route + TLS coverage in one `If-Match` write
 - [x] `caddy.route.delete` (admin) — remove a host's route; shared routes only lose the host
 - [x] `caddy.tls.ensure` (admin) — TLS coverage plus `certificates.automate` for a host with no route
-- [x] `caddy.reload` (admin) — `POST /load` of the running config
+- [x] `caddy.reload` (admin) — guarded `POST /config/` of the running config (`POST /load` ignores `If-Match`)
 
 Writes run by default and are dry-run aware: `dryRun=true` reads the live config
 and returns the computed plan without writing. 412 conflicts are retried up to
