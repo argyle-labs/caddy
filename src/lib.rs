@@ -1,48 +1,18 @@
-//! Caddy admin-API client + service backend.
-//!
-//! Drives an already-running Caddy reverse proxy over its documented admin API
-//! (default `http://localhost:2019`, but the endpoint is per-instance). The
-//! operational surface is reverse-proxy route management (hostname → upstream)
-//! plus config read / reload / status — so you stop hand-editing the Caddyfile.
-//!
-//! The wire surface is the toolkit's cap-backed HTTP client (`delegated-http`),
-//! so every request rides orca's `http.request` capability and this plugin links
-//! no reqwest/rustls. Hand-written call sites join their `/config/...` route onto
-//! [`Config::base_url`].
-//!
-//! ## Route model — surgical `/config/...` edits, not full `/load`
-//! Caddy has no "upsert route by host" primitive and applies every admin write
-//! live. We therefore read the full config once (`GET /config/`), mutate only the
-//! target server's `routes` array in memory (least-destructive: an existing route
-//! matching the host has its `reverse_proxy` upstreams replaced in place; a new
-//! host is appended as a canonical route), then write just that subtree back with
-//! `PATCH /config/apps/http/servers/<srv>/routes`. This leaves TLS automation and
-//! every other app untouched — unlike `POST /load`, which replaces the whole
-//! config. `caddy.reload` is the one deliberate full re-apply (see [`reload`]).
-
 #![allow(clippy::disallowed_types)]
 
+pub mod api;
+pub mod redact;
+pub mod routes;
+pub mod tls;
 pub mod tools;
 
-use plugin_toolkit::reqwest;
-use plugin_toolkit::serde_json::{json, Value};
+use plugin_toolkit::clap;
+
 use plugin_toolkit::service::{
     BoxFuture, Routes, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
     WorkloadSpec,
 };
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
-/// caddy service backend — Caddy reverse proxy.
-///
-/// Implements `ServiceBackend` so the generic `service.*` tools
-/// (deploy/backup/restore/configure/status/connect/sync) drive caddy. This facet
-/// is registered ALONGSIDE the `#[orca_tool]` route-management surface in
-/// [`tools`] — one binary, both facets, via the `Plugin` builder. Modeled on the
-/// adguard/nfs backends. See orca/docs/PLUGIN-PROGRAM.md.
-///
-/// Holds only the provider name; per-instance routes/creds come from the
-/// `Routes` the generic `service.*` tools hand each op.
 #[derive(Debug, Clone)]
 pub struct CaddyBackend {
     provider: &'static str,
@@ -59,9 +29,6 @@ impl ServiceBackend for CaddyBackend {
         self.provider
     }
 
-    /// Runtimes caddy can be placed on. `service.deploy` hands the
-    /// `workload_spec` below to a matching deploy target — this backend never
-    /// drives pct/docker itself (that mechanic lives in the deploy-target domain).
     fn runtimes(&self) -> Vec<Runtime> {
         vec![Runtime::Docker, Runtime::Podman, Runtime::Lxc, Runtime::Vm]
     }
@@ -80,10 +47,6 @@ impl ServiceBackend for CaddyBackend {
         80
     }
 
-    /// In-workload paths holding config/data. This is ALL caddy declares for
-    /// backup — the generic pluggable backup (tar for containers/LXC, PBS for
-    /// Proxmox guests when available) snapshots these. No backup/restore code
-    /// here; those are inherited from ServiceBackend's defaults.
     fn data_paths(&self) -> Vec<String> {
         vec!["/config".to_string(), "/data".to_string()]
     }
@@ -94,9 +57,6 @@ impl ServiceBackend for CaddyBackend {
         _instance: &'a str,
         _routes: &'a Routes,
     ) -> BoxFuture<'a, Result<WorkloadSpec, ServiceError>> {
-        // TODO: describe the caddy workload (image/template, ports, mounts,
-        // env) for the chosen runtime. The deploy target turns this into a
-        // compose service / LXC config / VM. See deploy-target::WorkloadSpec.
         Box::pin(async move { Err(ServiceError::unimplemented("caddy.workload_spec")) })
     }
 
@@ -106,7 +66,6 @@ impl ServiceBackend for CaddyBackend {
         _routes: &'a Routes,
         _config: &'a str,
     ) -> BoxFuture<'a, Result<(), ServiceError>> {
-        // TODO: apply caddy-specific config idempotently.
         Box::pin(async move { Err(ServiceError::unimplemented("caddy.configure")) })
     }
 
@@ -115,394 +74,92 @@ impl ServiceBackend for CaddyBackend {
         _instance: &'a str,
         _routes: &'a Routes,
     ) -> BoxFuture<'a, Result<ServiceStatus, ServiceError>> {
-        // TODO: real health/diagnostics.
         Box::pin(async move { Err(ServiceError::unimplemented("caddy.status")) })
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Surfaced view types
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// A single reverse-proxy route as surfaced by `caddy.route.list`/`set`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct Route {
-    /// The http server this route lives under (`apps.http.servers.<server>`).
-    pub server: String,
-    /// The hostnames this route matches (`match[].host[]`).
-    pub hosts: Vec<String>,
-    /// The reverse-proxy upstream dial addresses (`handle[].upstreams[].dial`).
-    pub upstreams: Vec<String>,
-}
-
-/// The subset of running state `caddy.status` surfaces. Caddy's admin API exposes
-/// no version endpoint, so status is derived from `GET /config/` reachability.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct Status {
-    /// `GET /config/` returned 2xx.
-    pub reachable: bool,
-    /// Names of the configured `apps.http.servers`.
-    pub servers: Vec<String>,
-    /// Total reverse-proxy routes across all http servers.
-    pub routes: usize,
-    /// Live upstreams reported by `GET /reverse_proxy/upstreams`.
-    pub upstreams: usize,
-}
-
-#[derive(Debug, Error)]
-pub enum CaddyError {
-    #[error("caddy transport: {0}")]
-    Transport(String),
-    #[error("caddy api error (status {status}): {body}")]
-    Api { status: u16, body: String },
-    #[error("malformed caddy response: {0}")]
-    Malformed(String),
-    #[error("caddy config: {0}")]
-    Config(String),
-}
-
-#[derive(Debug, Clone)]
-pub struct Config {
-    /// Base URL of the Caddy admin API (e.g. `http://10.0.0.5:2019`). The
-    /// `/config/...` API path is joined onto this.
-    pub base_url: String,
-    /// Optional bearer token. The admin API is unauthenticated on localhost by
-    /// default; set this only when a front-end/proxy guards it.
-    pub api_key: Option<String>,
-    /// Skip TLS verification (self-signed cert on an https admin front-end).
-    pub insecure: bool,
-}
-
-impl Config {
-    pub fn new(base_url: impl Into<String>) -> Self {
-        Self {
-            base_url: base_url.into(),
-            api_key: None,
-            insecure: false,
-        }
-    }
-
-    pub fn api_key(mut self, key: Option<String>) -> Self {
-        self.api_key = key.filter(|k| !k.is_empty());
-        self
-    }
-
-    pub fn insecure(mut self, on: bool) -> Self {
-        self.insecure = on;
-        self
-    }
-
-    /// Build the cap-backed HTTP client, attaching a bearer `authorization`
-    /// header only when an api_key is configured (admin API is usually open).
-    pub fn build_client(&self) -> Result<reqwest::Client, CaddyError> {
-        let mut builder = plugin_toolkit::api_client::ApiClientBuilder::new();
-        if let Some(key) = &self.api_key {
-            builder = builder
-                .header("authorization", format!("Bearer {key}"))
-                .map_err(|e| CaddyError::Transport(format!("client build: {e}")))?;
-        }
-        builder
-            .insecure(self.insecure)
-            .build()
-            .map_err(|e| CaddyError::Transport(format!("client build: {e}")))
-    }
-
-    /// Join an admin-API `path` onto the base URL (leading `/` optional).
-    fn admin_url(&self, path: &str) -> String {
-        format!(
-            "{}/{}",
-            self.base_url.trim_end_matches('/'),
-            path.trim_start_matches('/')
-        )
-    }
-}
-
-fn transport(e: impl std::fmt::Display) -> CaddyError {
-    CaddyError::Transport(e.to_string())
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Admin-API primitives
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// `GET /config/` — the full current config as JSON.
-pub async fn get_config(client: &reqwest::Client, cfg: &Config) -> Result<Value, CaddyError> {
-    let resp = client
-        .get(cfg.admin_url("config/"))
-        .send()
-        .await
-        .map_err(transport)?;
-    let status = resp.status();
-    let body = resp.text().await.map_err(transport)?;
-    if !status.is_success() {
-        return Err(CaddyError::Api {
-            status: status.as_u16(),
-            body,
-        });
-    }
-    // An empty config comes back as the literal `null`; normalize to an object.
-    if body.trim().is_empty() || body.trim() == "null" {
-        return Ok(json!({}));
-    }
-    plugin_toolkit::serde_json::from_str(&body).map_err(|e| CaddyError::Malformed(e.to_string()))
-}
-
-/// `POST /load` — replace the entire config. Forces a reload even if unchanged.
-pub async fn load_config(
-    client: &reqwest::Client,
-    cfg: &Config,
-    config: &Value,
-) -> Result<(), CaddyError> {
-    let resp = client
-        .post(cfg.admin_url("load"))
-        .header(
-            "cache-control",
-            reqwest::header::HeaderValue::from_static("must-revalidate"),
-        )
-        .json(config)
-        .send()
-        .await
-        .map_err(transport)?;
-    ok_or_api(resp).await
-}
-
-/// `PATCH /config/<path>` — strictly replace the value at an existing config
-/// path. Used to write one server's `routes` array back after an in-memory edit.
-pub async fn patch_path(
-    client: &reqwest::Client,
-    cfg: &Config,
-    path: &str,
-    value: &Value,
-) -> Result<(), CaddyError> {
-    let resp = client
-        .patch(cfg.admin_url(&format!("config/{}", path.trim_start_matches('/'))))
-        .json(value)
-        .send()
-        .await
-        .map_err(transport)?;
-    ok_or_api(resp).await
-}
-
-/// Number of live upstreams from `GET /reverse_proxy/upstreams` (0 if the
-/// endpoint is unavailable on this build).
-pub async fn upstream_count(client: &reqwest::Client, cfg: &Config) -> usize {
-    let Ok(resp) = client
-        .get(cfg.admin_url("reverse_proxy/upstreams"))
-        .send()
-        .await
-    else {
-        return 0;
-    };
-    if !resp.status().is_success() {
-        return 0;
-    }
-    let Ok(body) = resp.text().await else {
-        return 0;
-    };
-    plugin_toolkit::serde_json::from_str::<Value>(&body)
-        .ok()
-        .and_then(|v| v.as_array().map(|a| a.len()))
-        .unwrap_or(0)
-}
-
-async fn ok_or_api(resp: reqwest::Response) -> Result<(), CaddyError> {
-    let status = resp.status();
-    if status.is_success() {
-        Ok(())
-    } else {
-        let body = resp.text().await.unwrap_or_default();
-        Err(CaddyError::Api {
-            status: status.as_u16(),
-            body,
-        })
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Route operations (read-modify-write on the routes array)
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Enumerate every reverse-proxy route across all http servers.
-pub fn list_routes(config: &Value) -> Vec<Route> {
-    let mut out = Vec::new();
-    let Some(servers) = servers_map(config) else {
-        return out;
-    };
-    for (server, srv) in servers {
-        for route in server_routes(srv) {
-            if let Some(upstreams) = route_upstreams(route) {
-                out.push(Route {
-                    server: server.clone(),
-                    hosts: route_hosts(route),
-                    upstreams,
-                });
-            }
-        }
-    }
-    out
-}
-
-/// Total reverse-proxy routes across all http servers.
-pub fn route_count(config: &Value) -> usize {
-    list_routes(config).len()
-}
-
-/// The names of the configured `apps.http.servers`.
-pub fn server_names(config: &Value) -> Vec<String> {
-    servers_map(config)
-        .map(|m| m.keys().cloned().collect())
-        .unwrap_or_default()
-}
-
-/// Pick the http server to operate on: the caller's choice if given, else the
-/// sole server. Errors (listing candidates) when the choice is ambiguous/absent.
-pub fn choose_server(config: &Value, requested: Option<&str>) -> Result<String, CaddyError> {
-    let names = server_names(config);
-    match requested {
-        Some(name) => {
-            if names.iter().any(|n| n == name) {
-                Ok(name.to_string())
-            } else {
-                Err(CaddyError::Config(format!(
-                    "no http server '{name}' (have: {})",
-                    join_or_none(&names)
-                )))
-            }
-        }
-        None => match names.as_slice() {
-            [only] => Ok(only.clone()),
-            [] => Err(CaddyError::Config(
-                "no apps.http.servers configured; specify --server".into(),
-            )),
-            _ => Err(CaddyError::Config(format!(
-                "multiple http servers ({}); specify --server",
-                join_or_none(&names)
-            ))),
-        },
-    }
-}
-
-/// Least-destructive upsert of one server's routes: if a route already matches
-/// `host`, replace its reverse_proxy upstreams in place (preserving its other
-/// fields); otherwise append a canonical `host → upstreams` route. Returns the
-/// new routes array for that server. Pure — the caller PATCHes it back.
-pub fn upsert_route(
-    config: &Value,
-    server: &str,
-    host: &str,
-    upstreams: &[String],
-) -> Result<Value, CaddyError> {
-    let mut routes = server_routes_owned(config, server);
-    let dials: Vec<Value> = upstreams.iter().map(|u| json!({ "dial": u })).collect();
-
-    if let Some(route) = routes
-        .iter_mut()
-        .find(|r| route_upstreams(r).is_some() && route_matches_host(r, host))
-    {
-        // Replace the reverse_proxy handler's upstreams in place.
-        if let Some(handlers) = route.get_mut("handle").and_then(Value::as_array_mut) {
-            for h in handlers {
-                if h.get("handler").and_then(Value::as_str) == Some("reverse_proxy") {
-                    h["upstreams"] = Value::Array(dials.clone());
-                }
-            }
-        }
-    } else {
-        routes.push(json!({
-            "match": [{ "host": [host] }],
-            "handle": [{ "handler": "reverse_proxy", "upstreams": dials }],
-            "terminal": true,
-        }));
-    }
-    Ok(Value::Array(routes))
-}
-
-/// Drop every reverse-proxy route matching `host` from a server; returns the new
-/// routes array and whether anything was removed.
-pub fn delete_route(config: &Value, server: &str, host: &str) -> (Value, bool) {
-    let routes = server_routes_owned(config, server);
-    let before = routes.len();
-    let kept: Vec<Value> = routes
-        .into_iter()
-        .filter(|r| !(route_upstreams(r).is_some() && route_matches_host(r, host)))
-        .collect();
-    let removed = kept.len() != before;
-    (Value::Array(kept), removed)
-}
-
-// ── pure helpers over the config Value ──────────────────────────────────────
-
-fn servers_map(config: &Value) -> Option<&plugin_toolkit::serde_json::Map<String, Value>> {
-    config.get("apps")?.get("http")?.get("servers")?.as_object()
-}
-
-fn server_routes(srv: &Value) -> &[Value] {
-    srv.get("routes")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
-}
-
-fn server_routes_owned(config: &Value, server: &str) -> Vec<Value> {
-    servers_map(config)
-        .and_then(|m| m.get(server))
-        .map(server_routes)
-        .map(<[Value]>::to_vec)
-        .unwrap_or_default()
-}
-
-/// The `handle[].reverse_proxy.upstreams[].dial` list, or `None` if the route has
-/// no reverse_proxy handler.
-fn route_upstreams(route: &Value) -> Option<Vec<String>> {
-    let handlers = route.get("handle")?.as_array()?;
-    let mut found = false;
-    let mut dials = Vec::new();
-    for h in handlers {
-        if h.get("handler").and_then(Value::as_str) == Some("reverse_proxy") {
-            found = true;
-            if let Some(ups) = h.get("upstreams").and_then(Value::as_array) {
-                for u in ups {
-                    if let Some(d) = u.get("dial").and_then(Value::as_str) {
-                        dials.push(d.to_string());
-                    }
-                }
-            }
-        }
-    }
-    found.then_some(dials)
-}
-
-fn route_hosts(route: &Value) -> Vec<String> {
-    let mut hosts = Vec::new();
-    if let Some(matchers) = route.get("match").and_then(Value::as_array) {
-        for m in matchers {
-            if let Some(hs) = m.get("host").and_then(Value::as_array) {
-                for h in hs {
-                    if let Some(s) = h.as_str() {
-                        hosts.push(s.to_string());
-                    }
-                }
-            }
-        }
-    }
-    hosts
-}
-
-fn route_matches_host(route: &Value, host: &str) -> bool {
-    route_hosts(route).iter().any(|h| h == host)
-}
-
-fn join_or_none(names: &[String]) -> String {
-    if names.is_empty() {
-        "none".to_string()
-    } else {
-        names.join(", ")
-    }
+#[plugin_toolkit::endpoint_resource(plugin = "caddy", skip = "list,detail")]
+pub struct CaddyEndpoint {
+    pub name: String,
+    #[secret]
+    pub api_key: String,
+    pub enabled: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plugin_toolkit::serde_json::{self, json, Value};
+    use std::sync::{Arc, Mutex};
+
+    const KEY: &str = "caddykey-0123456789abcdef";
+
+    type Reply = Option<(u16, Vec<(String, String)>, String)>;
+
+    #[derive(Debug, Clone)]
+    struct Call {
+        method: String,
+        path: String,
+        headers: String,
+        body: Value,
+    }
+
+    fn serve<F>(route: impl Fn(&str, &str) -> Reply + 'static, body: F) -> Vec<Call>
+    where
+        F: FnOnce(),
+    {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        plugin_toolkit::capsink::with_cap_sink(
+            Box::new(move |cap: &str, req: &str| {
+                assert_eq!(cap, "http.request");
+                let req: Value = serde_json::from_str(req).unwrap();
+                let url = req["url"].as_str().unwrap();
+                let path = url
+                    .strip_prefix("http://c.test/")
+                    .unwrap_or_else(|| panic!("unexpected url {url}"))
+                    .to_string();
+                let method = req["method"].as_str().unwrap().to_string();
+                let body = match req["body"].as_array() {
+                    Some(b) if !b.is_empty() => {
+                        let bytes: Vec<u8> = b.iter().map(|x| x.as_u64().unwrap() as u8).collect();
+                        serde_json::from_slice(&bytes).unwrap()
+                    }
+                    _ => Value::Null,
+                };
+                log.lock().unwrap().push(Call {
+                    method: method.clone(),
+                    path: path.clone(),
+                    headers: req["headers"].to_string(),
+                    body,
+                });
+                let (status, headers, body) =
+                    route(&method, &path).unwrap_or((404, vec![], "Not Found".into()));
+                Ok(
+                    json!({"status": status, "headers": headers, "body": body.into_bytes()})
+                        .to_string(),
+                )
+            }),
+            body,
+        );
+        let out = seen.lock().unwrap().clone();
+        out
+    }
+
+    fn block<T>(f: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    fn c() -> api::Caddy {
+        api::Caddy::new("http://c.test/", Some(KEY)).unwrap()
+    }
+
+    fn etag(tag: &str) -> Vec<(String, String)> {
+        vec![("Etag".into(), tag.into())]
+    }
 
     fn sample() -> Value {
         json!({
@@ -513,10 +170,6 @@ mod tests {
                         "handle": [{ "handler": "reverse_proxy",
                                      "upstreams": [{ "dial": "10.0.0.5:8080" }] }],
                         "terminal": true
-                    },
-                    {
-                        "match": [{ "host": ["static.example.com"] }],
-                        "handle": [{ "handler": "file_server" }]
                     }
                 ]}
             }}}
@@ -529,70 +182,585 @@ mod tests {
     }
 
     #[test]
-    fn admin_url_joins_cleanly() {
-        let cfg = Config::new("http://host:2019/");
-        assert_eq!(cfg.admin_url("config/"), "http://host:2019/config/");
-        assert_eq!(cfg.admin_url("/load"), "http://host:2019/load");
+    fn config_reads_body_and_etag_with_bearer() {
+        let mut snap = None;
+        let calls = serve(
+            |_, _| Some((200, etag(r#""/config/ abc""#), sample().to_string())),
+            || snap = Some(block(c().config()).unwrap()),
+        );
+        let snap = snap.unwrap();
+        assert_eq!(snap.config, sample());
+        assert_eq!(snap.etag.as_deref(), Some(r#""/config/ abc""#));
+        assert_eq!(calls[0].method, "GET");
+        assert_eq!(calls[0].path, "config/");
+        assert!(
+            calls[0].headers.contains(&format!("Bearer {KEY}")),
+            "{}",
+            calls[0].headers
+        );
     }
 
     #[test]
-    fn list_routes_surfaces_only_reverse_proxy() {
-        let routes = list_routes(&sample());
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].server, "srv0");
-        assert_eq!(routes[0].hosts, vec!["a.example.com"]);
-        assert_eq!(routes[0].upstreams, vec!["10.0.0.5:8080"]);
+    fn empty_config_reads_as_an_object() {
+        serve(
+            |_, _| Some((200, vec![], "null\n".into())),
+            || assert_eq!(block(c().config()).unwrap().config, json!({})),
+        );
     }
 
     #[test]
-    fn choose_server_picks_sole_and_rejects_missing() {
-        let cfg = sample();
-        assert_eq!(choose_server(&cfg, None).unwrap(), "srv0");
-        assert_eq!(choose_server(&cfg, Some("srv0")).unwrap(), "srv0");
-        assert!(choose_server(&cfg, Some("nope")).is_err());
+    fn no_api_key_sends_no_authorization() {
+        let calls = serve(
+            |_, _| Some((200, vec![], "{}".into())),
+            || {
+                block(api::Caddy::new("http://c.test", None).unwrap().config()).unwrap();
+            },
+        );
+        assert!(
+            !calls[0].headers.to_lowercase().contains("authorization"),
+            "{}",
+            calls[0].headers
+        );
     }
 
     #[test]
-    fn upsert_updates_existing_host_in_place() {
-        let cfg = sample();
-        let routes = upsert_route(&cfg, "srv0", "a.example.com", &["10.0.0.9:80".into()]).unwrap();
-        let arr = routes.as_array().unwrap();
-        // No new route appended — still two, and the file_server route is intact.
-        assert_eq!(arr.len(), 2);
-        assert_eq!(route_upstreams(&arr[0]).unwrap(), vec!["10.0.0.9:80"]);
-        assert_eq!(route_hosts(&arr[1]), vec!["static.example.com"]);
+    fn patch_sends_if_match_and_body() {
+        let calls = serve(
+            |_, _| Some((200, vec![], String::new())),
+            || {
+                block(c().patch(
+                    "apps/http/servers/srv0/routes",
+                    &json!([]),
+                    Some("\"/config/ abc\""),
+                ))
+                .unwrap()
+            },
+        );
+        assert_eq!(calls[0].method, "PATCH");
+        assert_eq!(calls[0].path, "config/apps/http/servers/srv0/routes");
+        assert_eq!(calls[0].body, json!([]));
+        assert!(
+            calls[0].headers.contains("if-match"),
+            "{}",
+            calls[0].headers
+        );
     }
 
     #[test]
-    fn upsert_appends_new_host() {
-        let cfg = sample();
-        let routes =
-            upsert_route(&cfg, "srv0", "b.example.com", &["10.0.0.7:3000".into()]).unwrap();
-        let arr = routes.as_array().unwrap();
-        assert_eq!(arr.len(), 3);
-        let last = arr.last().unwrap();
-        assert_eq!(route_hosts(last), vec!["b.example.com"]);
-        assert_eq!(route_upstreams(last).unwrap(), vec!["10.0.0.7:3000"]);
-        assert_eq!(last.get("terminal").and_then(Value::as_bool), Some(true));
+    fn precondition_failed_reports_a_concurrent_change() {
+        let e = serve_err(
+            |_, _| Some((412, vec![], "etag mismatch".into())),
+            |c| block(c.patch("apps", &json!({}), Some("\"x\""))).unwrap_err(),
+        );
+        assert!(e.contains("changed concurrently"), "{e}");
+        let e = plugin_toolkit::capsink::with_cap_sink(
+            Box::new(|_: &str, _: &str| {
+                Ok(json!({"status": 412, "headers": [], "body": []}).to_string())
+            }),
+            || block(c().patch("apps", &json!({}), None)).unwrap_err(),
+        );
+        assert!(api::is_conflict(&e));
     }
 
     #[test]
-    fn delete_removes_matching_reverse_proxy_route() {
-        let cfg = sample();
-        let (routes, removed) = delete_route(&cfg, "srv0", "a.example.com");
-        assert!(removed);
-        let arr = routes.as_array().unwrap();
-        assert_eq!(arr.len(), 1);
-        assert_eq!(route_hosts(&arr[0]), vec!["static.example.com"]);
+    fn replace_forces_a_guarded_reload() {
+        let calls = serve(
+            |_, _| Some((200, vec![], String::new())),
+            || block(c().replace(&sample(), Some("\"/config/ abc\""))).unwrap(),
+        );
+        assert_eq!(calls[0].method, "POST");
+        assert_eq!(calls[0].path, "config/");
+        assert!(
+            calls[0].headers.contains("if-match"),
+            "{}",
+            calls[0].headers
+        );
+        assert!(
+            calls[0].headers.contains("must-revalidate"),
+            "{}",
+            calls[0].headers
+        );
+        assert_eq!(calls[0].body, sample());
+    }
 
-        let (_, removed_none) = delete_route(&cfg, "srv0", "missing.example.com");
-        assert!(!removed_none);
+    fn serve_err(
+        route: impl Fn(&str, &str) -> Reply + 'static,
+        f: impl FnOnce(api::Caddy) -> plugin_toolkit::anyhow::Error,
+    ) -> String {
+        let mut out = String::new();
+        serve(route, || out = format!("{:#}", f(c())));
+        out
     }
 
     #[test]
-    fn server_names_and_route_count() {
-        let cfg = sample();
-        assert_eq!(server_names(&cfg), vec!["srv0"]);
-        assert_eq!(route_count(&cfg), 1);
+    fn api_errors_are_redacted_scrubbed_and_truncated() {
+        let e = serve_err(
+            |_, _| {
+                Some((
+                    400,
+                    vec![],
+                    format!(
+                        r#"{{"error":"bad {KEY}","api_token":"cf-secret-value"}}{}"#,
+                        "x".repeat(api::ERROR_EXCERPT * 2)
+                    ),
+                ))
+            },
+            |c| block(c.config()).unwrap_err(),
+        );
+        assert!(e.starts_with("GET /config/: HTTP 400"), "{e}");
+        assert!(!e.contains(KEY), "{e}");
+        assert!(!e.contains("cf-secret-value"), "{e}");
+        assert!(e.len() < api::ERROR_EXCERPT + 64, "{}", e.len());
+    }
+
+    #[test]
+    fn transport_errors_are_redacted() {
+        let e = plugin_toolkit::capsink::with_cap_sink(
+            Box::new(|_: &str, _: &str| Err(format!("connect refused Bearer {KEY}"))),
+            || format!("{:#}", block(c().config()).unwrap_err()),
+        );
+        assert!(e.starts_with("GET /config/:"), "{e}");
+        assert!(!e.contains(KEY), "{e}");
+    }
+
+    #[test]
+    fn upstream_count_counts_entries() {
+        serve(
+            |_, p| {
+                (p == "reverse_proxy/upstreams").then(|| {
+                    (
+                        200,
+                        vec![],
+                        json!([{"address": "10.0.0.5:8080"}, {"address": "x:1"}]).to_string(),
+                    )
+                })
+            },
+            || assert_eq!(block(c().upstream_count()).unwrap(), 2),
+        );
+    }
+
+    #[test]
+    fn missing_api_key_secret_means_no_auth() {
+        let out = plugin_toolkit::capsink::with_cap_sink(
+            Box::new(|cap: &str, _: &str| match cap {
+                "secret.op" => Ok(json!({"value": null, "found": false}).to_string()),
+                _ => Err(format!("unexpected {cap}")),
+            }),
+            || tools::api_key("edge").unwrap(),
+        );
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn api_key_lookup_failure_is_an_error() {
+        let e = plugin_toolkit::capsink::with_cap_sink(
+            Box::new(|_: &str, _: &str| Err("store offline".into())),
+            || tools::api_key("edge").unwrap_err(),
+        );
+        assert!(format!("{e:#}").contains("store offline"), "{e:#}");
+    }
+
+    #[test]
+    fn write_verbs_accept_dry_run() {
+        let cfg = Arc::new(plugin_toolkit::contract::config::Config::load().unwrap());
+        let ctx = plugin_toolkit::contract::ToolCtx::new(cfg);
+        plugin_toolkit::capsink::with_cap_sink(
+            Box::new(|cap: &str, _: &str| Err(format!("unexpected {cap}"))),
+            || {
+                for (tool, args) in [
+                    ("caddy.reload", json!({"name": "edge", "dryRun": true})),
+                    (
+                        "caddy.route.set",
+                        json!({"name": "edge", "host": "a.example.com", "upstream": ["10.0.0.5:80"], "dryRun": true}),
+                    ),
+                    (
+                        "caddy.route.delete",
+                        json!({"name": "edge", "host": "a.example.com", "dryRun": true}),
+                    ),
+                    (
+                        "caddy.tls.ensure",
+                        json!({"name": "edge", "host": "a.example.com", "dryRun": true}),
+                    ),
+                    (
+                        "caddy.config.persist",
+                        json!({"name": "edge", "dryRun": true}),
+                    ),
+                ] {
+                    let e =
+                        block(plugin_toolkit::dispatch::dispatch(tool, args, &ctx)).unwrap_err();
+                    let e = format!("{e:#}");
+                    assert!(!e.contains("does not support dryRun"), "{tool}: {e}");
+                    assert!(e.contains("unexpected secret.op"), "{tool}: {e}");
+                }
+            },
+        );
+    }
+
+    fn live() -> Value {
+        json!({
+            "apps": {
+                "http": { "servers": { "srv0": { "listen": [":443"], "routes": [
+                    {
+                        "match": [{ "host": ["gitea.scottkey.me"] }],
+                        "handle": [{ "handler": "subroute", "routes": [
+                            { "handle": [{ "handler": "reverse_proxy",
+                                           "upstreams": [{ "dial": "10.0.0.20:3000" }] }] }
+                        ]}],
+                        "terminal": true
+                    },
+                    {
+                        "match": [{ "host": ["static.scottkey.me"], "path": ["/x"] }],
+                        "handle": [{ "handler": "reverse_proxy",
+                                     "upstreams": [{ "dial": "10.0.0.21:80" }] }]
+                    }
+                ]}}},
+                "tls": { "automation": { "policies": [
+                    { "subjects": ["gitea.scottkey.me"],
+                      "issuers": [{ "module": "acme", "challenges": { "dns": { "provider":
+                          { "name": "cloudflare", "api_token": "cf-literal-token" } } } }] }
+                ]}}
+            }
+        })
+    }
+
+    struct Fake {
+        state: Arc<Mutex<Value>>,
+        conflicts: Arc<Mutex<usize>>,
+    }
+
+    impl Fake {
+        fn new(initial: Value, conflicts: usize) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(initial)),
+                conflicts: Arc::new(Mutex::new(conflicts)),
+            }
+        }
+
+        fn route(&self) -> impl Fn(&str, &str) -> Reply + 'static {
+            let state = self.state.clone();
+            let conflicts = self.conflicts.clone();
+            move |method: &str, path: &str| {
+                let cfg = state.lock().unwrap().clone();
+                let tag = format!("\"/config/ {:x}\"", cfg.to_string().len());
+                match (method, path) {
+                    ("GET", "config/") => Some((200, etag(&tag), cfg.to_string())),
+                    ("POST", "load") => Some((200, vec![], String::new())),
+                    (_, p) if p.starts_with("config/") => {
+                        let mut left = conflicts.lock().unwrap();
+                        if *left > 0 {
+                            *left -= 1;
+                            return Some((412, vec![], String::new()));
+                        }
+                        Some((200, vec![], String::new()))
+                    }
+                    _ => None,
+                }
+            }
+        }
+
+        fn serve(&self, f: impl FnOnce()) -> Vec<Call> {
+            let calls = serve(self.route(), f);
+            let mut cfg = self.state.lock().unwrap();
+            for call in calls
+                .iter()
+                .filter(|c| c.method != "GET" && c.path != "load")
+            {
+                let key = call.path.trim_start_matches("config/").to_string();
+                if key.is_empty() {
+                    *cfg = call.body.clone();
+                    continue;
+                }
+                cfg[key] = call.body.clone();
+            }
+            calls
+        }
+
+        fn config(&self) -> Value {
+            self.state.lock().unwrap().clone()
+        }
+    }
+
+    fn writes(calls: &[Call]) -> Vec<&Call> {
+        calls.iter().filter(|c| c.method != "GET").collect()
+    }
+
+    fn set_args() -> tools::RouteSetArgs {
+        tools::RouteSetArgs {
+            name: "edge".into(),
+            host: "Orca.ScottKey.me".into(),
+            upstream: vec!["10.0.0.6:12000".into()],
+            server: None,
+        }
+    }
+
+    #[test]
+    fn route_set_writes_tls_and_route_atomically() {
+        let fake = Fake::new(live(), 0);
+        let mut out = None;
+        let calls =
+            fake.serve(|| out = Some(block(tools::set_route(&c(), &set_args(), false)).unwrap()));
+        let out = out.unwrap();
+        assert!(out.changed && !out.dry_run);
+        assert_eq!(out.route.hosts, vec!["orca.scottkey.me"]);
+        assert_eq!(out.action, routes::RouteAction::Inserted);
+        assert_eq!(out.tls.action, tls::TlsAction::SubjectAdded);
+        assert_eq!(out.tls.challenge, tls::Challenge::Dns01);
+        let w = writes(&calls);
+        assert_eq!(w.len(), 1, "{calls:?}");
+        assert_eq!(
+            (w[0].method.as_str(), w[0].path.as_str()),
+            ("PATCH", "config/apps")
+        );
+        assert!(w[0].headers.contains("if-match"), "{}", w[0].headers);
+        assert_eq!(
+            w[0].body["tls"]["automation"]["policies"][0]["subjects"],
+            json!(["gitea.scottkey.me", "orca.scottkey.me"])
+        );
+        assert_eq!(
+            w[0].body["tls"]["automation"]["policies"][0]["issuers"][0]["challenges"]["dns"]
+                ["provider"]["api_token"],
+            json!("cf-literal-token")
+        );
+        assert_eq!(
+            w[0].body["http"]["servers"]["srv0"]["routes"][2]["match"],
+            json!([{ "host": ["orca.scottkey.me"] }])
+        );
+        let report = serde_json::to_string(&out).unwrap();
+        assert!(!report.contains("cf-literal-token"), "{report}");
+        assert!(report.contains("\"dryRun\":false"), "{report}");
+
+        let calls = fake.serve(|| {
+            let again = block(tools::set_route(&c(), &set_args(), false)).unwrap();
+            assert!(!again.changed);
+            assert_eq!(again.action, routes::RouteAction::Unchanged);
+            assert_eq!(again.tls.action, tls::TlsAction::Covered);
+        });
+        assert!(writes(&calls).is_empty(), "{calls:?}");
+    }
+
+    #[test]
+    fn route_set_dry_run_reads_and_plans_without_writing() {
+        let fake = Fake::new(live(), 0);
+        let mut out = None;
+        let calls =
+            fake.serve(|| out = Some(block(tools::set_route(&c(), &set_args(), true)).unwrap()));
+        let out = out.unwrap();
+        assert!(out.dry_run && out.changed);
+        assert_eq!(out.index, 2);
+        assert_eq!(out.changes.len(), 2);
+        assert_eq!(
+            out.changes[0].path,
+            "/apps/tls/automation/policies/0/subjects"
+        );
+        assert_eq!(out.changes[1].path, "/apps/http/servers/srv0/routes/2");
+        assert!(calls.iter().all(|c| c.method == "GET"), "{calls:?}");
+        assert_eq!(fake.config(), live());
+    }
+
+    #[test]
+    fn a_refused_route_writes_no_tls_either() {
+        let fake = Fake::new(live(), 0);
+        let calls = fake.serve(|| {
+            let mut a = set_args();
+            a.host = "static.scottkey.me".into();
+            let e = block(tools::set_route(&c(), &a, false))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("other conditions"), "{e}");
+        });
+        assert!(writes(&calls).is_empty(), "{calls:?}");
+        assert_eq!(fake.config(), live());
+    }
+
+    #[test]
+    fn route_set_refuses_to_route_to_the_admin_api() {
+        let fake = Fake::new(live(), 0);
+        let calls = fake.serve(|| {
+            let mut a = set_args();
+            a.upstream = vec!["127.0.0.1:2019".into()];
+            let e = block(tools::set_route(&c(), &a, false))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("admin API"), "{e}");
+        });
+        assert!(writes(&calls).is_empty());
+    }
+
+    #[test]
+    fn concurrent_changes_are_retried_then_reported() {
+        let fake = Fake::new(live(), 2);
+        let calls = fake.serve(|| {
+            block(tools::set_route(&c(), &set_args(), false)).unwrap();
+        });
+        assert_eq!(writes(&calls).len(), 3);
+        assert_eq!(calls.iter().filter(|c| c.method == "GET").count(), 3);
+
+        let fake = Fake::new(live(), tools::MAX_ATTEMPTS);
+        let calls = fake.serve(|| {
+            let e = block(tools::set_route(&c(), &set_args(), false)).unwrap_err();
+            assert!(api::is_conflict(&e), "{e:#}");
+        });
+        assert_eq!(writes(&calls).len(), tools::MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn route_set_rejects_bad_input_before_any_request() {
+        let calls = serve(
+            |_, _| None,
+            || {
+                for (host, up) in [
+                    ("orca.scottkey.me", "10.0.0.6"),
+                    ("orca.scottkey.me/x", "10.0.0.6:1"),
+                    ("orca.scottkey.me", "{upstream}:80"),
+                ] {
+                    let mut a = set_args();
+                    a.host = host.into();
+                    a.upstream = vec![up.into()];
+                    assert!(
+                        block(tools::set_route(&c(), &a, false)).is_err(),
+                        "{host} {up}"
+                    );
+                }
+            },
+        );
+        assert!(calls.is_empty(), "{calls:?}");
+    }
+
+    #[test]
+    fn route_delete_writes_apps_and_dry_run_does_not() {
+        let args = tools::RouteDeleteArgs {
+            name: "edge".into(),
+            host: "gitea.scottkey.me".into(),
+            server: None,
+        };
+        let fake = Fake::new(live(), 0);
+        let calls = fake.serve(|| {
+            let r = block(tools::delete_route(&c(), &args, true)).unwrap();
+            assert!(r.dry_run);
+            assert_eq!(r.action, routes::RouteAction::Removed);
+        });
+        assert!(writes(&calls).is_empty());
+        let calls = fake.serve(|| {
+            block(tools::delete_route(&c(), &args, false)).unwrap();
+        });
+        let w = writes(&calls);
+        assert_eq!(w[0].path, "config/apps");
+        assert_eq!(
+            w[0].body["http"]["servers"]["srv0"]["routes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn tls_ensure_adds_the_subject_and_automate_in_one_write() {
+        let fake = Fake::new(live(), 0);
+        let calls = fake.serve(|| {
+            let r = block(tools::ensure_tls(&c(), "orca.scottkey.me", false)).unwrap();
+            assert!(r.changed && r.tls.automate);
+        });
+        let w = writes(&calls);
+        assert_eq!(w.len(), 1);
+        assert_eq!(
+            w[0].body["tls"]["certificates"]["automate"],
+            json!(["orca.scottkey.me"])
+        );
+        let calls = fake.serve(|| {
+            assert!(
+                !block(tools::ensure_tls(&c(), "orca.scottkey.me", false))
+                    .unwrap()
+                    .changed
+            );
+        });
+        assert!(writes(&calls).is_empty());
+        let calls = fake.serve(|| {
+            let r = block(tools::ensure_tls(&c(), "orca.other.example", false)).unwrap();
+            assert_eq!(r.tls.action, tls::TlsAction::Default);
+            assert!(!r.changed && !r.warnings.is_empty());
+        });
+        assert!(writes(&calls).is_empty());
+    }
+
+    #[test]
+    fn persist_only_rewrites_an_explicit_false() {
+        let fake = Fake::new(live(), 0);
+        let calls = fake.serve(|| {
+            assert!(!block(tools::persist(&c(), false)).unwrap().changed);
+        });
+        assert!(writes(&calls).is_empty());
+        let mut cfg = live();
+        cfg["admin"] = json!({"config": {"persist": false}});
+        let fake = Fake::new(cfg, 0);
+        let calls = fake.serve(|| {
+            assert!(block(tools::persist(&c(), true)).unwrap().changed);
+        });
+        assert!(writes(&calls).is_empty());
+        let calls = fake.serve(|| {
+            assert!(block(tools::persist(&c(), false)).unwrap().changed);
+        });
+        let w = writes(&calls);
+        assert_eq!(w[0].path, "config/admin");
+        assert_eq!(w[0].body, json!({"config": {"persist": true}}));
+    }
+
+    #[test]
+    fn reload_dry_run_only_reads() {
+        let fake = Fake::new(live(), 0);
+        let calls = fake.serve(|| {
+            let r = block(tools::reload(&c(), true)).unwrap();
+            assert!(r.dry_run && !r.reloaded);
+            assert!(r.status.upstreams_error.is_some());
+        });
+        assert!(calls.iter().all(|c| c.method == "GET"), "{calls:?}");
+    }
+
+    #[test]
+    fn export_and_get_never_return_provider_secrets() {
+        let r = redact::redact_config(live());
+        assert!(!r.config.0.to_string().contains("cf-literal-token"));
+        assert_eq!(
+            r.redacted,
+            vec!["/apps/tls/automation/policies/0/issuers/0/challenges/dns/provider/api_token"]
+        );
+    }
+
+    #[test]
+    fn reload_sends_if_match_and_retries_conflicts() {
+        let fake = Fake::new(live(), 1);
+        let calls = fake.serve(|| {
+            assert!(block(tools::reload(&c(), false)).unwrap().reloaded);
+        });
+        let posts: Vec<&Call> = calls.iter().filter(|c| c.method == "POST").collect();
+        assert_eq!(posts.len(), 2, "{calls:?}");
+        assert!(posts.iter().all(|c| c.path == "config/"
+            && c.headers.contains("if-match")
+            && c.headers.contains("must-revalidate")
+            && c.body == live()));
+        assert!(calls.iter().all(|c| c.path != "load"));
+
+        let fake = Fake::new(live(), tools::MAX_ATTEMPTS);
+        fake.serve(|| {
+            let e = block(tools::reload(&c(), false)).unwrap_err();
+            assert!(api::is_conflict(&e), "{e:#}");
+        });
+    }
+
+    #[test]
+    fn writes_without_an_etag_are_refused() {
+        let calls = serve(
+            |m, p| (m == "GET" && p == "config/").then(|| (200, vec![], live().to_string())),
+            || {
+                let e = block(tools::set_route(&c(), &set_args(), false))
+                    .unwrap_err()
+                    .to_string();
+                assert!(e.contains("no Etag"), "{e}");
+                let e = block(tools::reload(&c(), false)).unwrap_err().to_string();
+                assert!(e.contains("no Etag"), "{e}");
+                assert!(block(tools::set_route(&c(), &set_args(), true)).is_ok());
+            },
+        );
+        assert!(calls.iter().all(|c| c.method == "GET"), "{calls:?}");
     }
 }
