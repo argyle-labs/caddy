@@ -91,9 +91,9 @@ orca caddy.config.persist --name edge
 orca caddy.reload        --name edge
 ```
 
-Writes run by default. With `dryRun=true` they still read the live config and return the same report (actions, route index, TLS decision, and a `changes` list of JSON-pointer before/after values) without writing anything. Reads need `read` and writes need `admin`.
+Writes run by default. When the call runs on the system that hosts the plugin, `dryRun=true` they still read the live config and return the same report (actions, route index, TLS decision, and a `changes` list of JSON-pointer before/after values) without writing anything. orca currently refuses `dryRun` on calls addressed to another system's id unless the tool is execute-gated, and these writes are dry-run aware instead; with option 1 below, run the dry run on the Caddy host's orca directly. Reads need `read` and writes need `admin`.
 
-Every write is planned from one `GET /config/` snapshot and applied as one `PATCH /config/apps` (or `/config/admin` for `config.persist`) carrying that snapshot's `Etag` as `If-Match`. If the config changed in between, Caddy answers HTTP 412 ([concurrent config changes](https://caddyserver.com/docs/api#concurrent-config-changes)), and the verb re-reads and re-plans, up to 3 attempts. Writes that change nothing are skipped. Every report warns when `admin.config.load` is set, because a config loader can replace admin-API changes ([`admin.config.load`](https://caddyserver.com/docs/json/admin/config/load/)).
+Every write is planned from one `GET /config/` snapshot and applied as one `PATCH /config/apps` (or `/config/admin` for `config.persist`) carrying that snapshot's `Etag` as `If-Match`. If `GET /config/` returns no `Etag`, the write is refused rather than sent unguarded. If the config changed in between, Caddy answers HTTP 412 ([concurrent config changes](https://caddyserver.com/docs/api#concurrent-config-changes)), and the verb re-reads and re-plans, up to 3 attempts. Writes that change nothing are skipped. Every report warns when `admin.config.load` is set, because a config loader can replace admin-API changes ([`admin.config.load`](https://caddyserver.com/docs/json/admin/config/load/)).
 
 | Tool | Role | Admin API |
 |---|---|---|
@@ -107,7 +107,7 @@ Every write is planned from one `GET /config/` snapshot and applied as one `PATC
 | `caddy.route.delete` | admin | `GET /config/`, `PATCH /config/apps` |
 | `caddy.tls.ensure` | admin | `GET /config/`, `PATCH /config/apps` |
 | `caddy.config.persist` | admin | `GET /config/`, `PATCH /config/admin` |
-| `caddy.reload` | admin | `GET /config/`, `POST /load` with `Cache-Control: must-revalidate` |
+| `caddy.reload` | admin | `GET /config/`, `POST /load` with `Cache-Control: must-revalidate` and `If-Match` |
 
 API references: [`GET/PUT/PATCH /config/[path]`](https://caddyserver.com/docs/api#get-configpath), [`POST /load`](https://caddyserver.com/docs/api#post-load), [`GET /reverse_proxy/upstreams`](https://caddyserver.com/docs/api#get-reverse-proxyupstreams), [TLS automation policies](https://caddyserver.com/docs/json/apps/tls/automation/policies/), [`apps.tls.certificates.automate`](https://caddyserver.com/docs/json/apps/tls/certificates/automate/), [`admin.config.persist`](https://caddyserver.com/docs/json/admin/config/persist/).
 
@@ -117,9 +117,9 @@ API references: [`GET/PUT/PATCH /config/[path]`](https://caddyserver.com/docs/ap
 
 No tool returns secrets. `caddy.config.get` and `caddy.config.export` replace with `<redacted>`:
 
-- every secret-shaped key (orca's shared scrub list: `password`, `token`, `secret`, `api_key`, ...);
-- every setting of a DNS provider module except its `name` (`issuers[*].challenges.dns.provider`, `apps.tls.dns`);
-- every ACME external-account setting except `key_id`.
+- every secret-shaped key (orca's shared scrub list: `password`, `token`, `secret`, `api_key`, ...), plus `connection_string`, `*dsn` and `*uri` keys;
+- every value of a DNS provider module (`issuers[*].challenges.dns.provider`, `apps.tls.dns`) and of an ACME `external_account`, whatever its shape, keeping only a string `name` (or `key_id`);
+- the `user:password@` part of any URL or `user:password@host` string, anywhere in the config (for example a storage `connection_string`, a redis `address`, or the `admin.config.load` URL). `caddy.route.list` strips it from dial addresses too.
 
 `caddy.config.export` also lists the JSON pointer of every redacted value. The export is for review and diffing, not restore. The restorable copy is Caddy's own `autosave.json`: `service.backup` covers it through the `/config` data path for the container image; a native install keeps it under the service user's home (`/var/lib/caddy/.config/caddy/` for the Debian package), which the backup must include.
 
@@ -128,7 +128,7 @@ No tool returns secrets. `caddy.config.get` and `caddy.config.export` replace wi
 - Hosts are lowercased before writing. Labels are 1-63 characters of `a-z`, `0-9` and `-`, and do not start or end with `-`. Internationalized names must be given in punycode (`xn--...`).
 - `*.example.com` is a [host matcher](https://caddyserver.com/docs/json/apps/http/servers/routes/match/host/) wildcard: it matches exactly one label (`a.example.com`, not `example.com` or `a.b.example.com`). The same rule decides TLS subject coverage.
 - Upstreams are `host:port`, `[ipv6]:port` or `unix//path`. Placeholders and URLs are refused.
-- The plugin refuses to point a route at this Caddy's admin API (`admin.listen`, default `localhost:2019`, or the endpoint's own address). It also refuses to change or delete the route for the hostname the endpoint reaches the admin API through, so orca cannot cut off its own access.
+- As a safety rail against mistakes, not an authorization boundary, the plugin refuses to point a route at this Caddy's admin API (any `127.0.0.0/8`, `::1` or IPv4-mapped loopback address counts as `localhost`) (`admin.listen`, default `localhost:2019`, or the endpoint's own address). It also refuses to change or delete the route for the hostname the endpoint reaches the admin API through, so orca cannot cut off its own access.
 
 ### Routes
 

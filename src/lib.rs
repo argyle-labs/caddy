@@ -266,10 +266,15 @@ mod tests {
     fn load_forces_a_reload() {
         let calls = serve(
             |_, _| Some((200, vec![], String::new())),
-            || block(c().load(&sample())).unwrap(),
+            || block(c().load(&sample(), Some("\"/config/ abc\""))).unwrap(),
         );
         assert_eq!(calls[0].method, "POST");
         assert_eq!(calls[0].path, "load");
+        assert!(
+            calls[0].headers.contains("if-match"),
+            "{}",
+            calls[0].headers
+        );
         assert!(
             calls[0].headers.contains("must-revalidate"),
             "{}",
@@ -439,7 +444,7 @@ mod tests {
                 let tag = format!("\"/config/ {:x}\"", cfg.to_string().len());
                 match (method, path) {
                     ("GET", "config/") => Some((200, etag(&tag), cfg.to_string())),
-                    ("PATCH", _) | ("PUT", _) => {
+                    ("PATCH", _) | ("PUT", _) | ("POST", "load") => {
                         let mut left = conflicts.lock().unwrap();
                         if *left > 0 {
                             *left -= 1;
@@ -455,7 +460,10 @@ mod tests {
         fn serve(&self, f: impl FnOnce()) -> Vec<Call> {
             let calls = serve(self.route(), f);
             let mut cfg = self.state.lock().unwrap();
-            for call in calls.iter().filter(|c| c.method != "GET") {
+            for call in calls
+                .iter()
+                .filter(|c| c.method != "GET" && c.path != "load")
+            {
                 let key = call.path.trim_start_matches("config/").to_string();
                 cfg[key] = call.body.clone();
             }
@@ -711,5 +719,40 @@ mod tests {
             r.redacted,
             vec!["/apps/tls/automation/policies/0/issuers/0/challenges/dns/provider/api_token"]
         );
+    }
+
+    #[test]
+    fn reload_sends_if_match_and_retries_conflicts() {
+        let fake = Fake::new(live(), 1);
+        let calls = fake.serve(|| {
+            assert!(block(tools::reload(&c(), false)).unwrap().reloaded);
+        });
+        let loads: Vec<&Call> = calls.iter().filter(|c| c.path == "load").collect();
+        assert_eq!(loads.len(), 2, "{calls:?}");
+        assert!(loads.iter().all(|c| c.headers.contains("if-match")));
+        assert_eq!(calls.iter().filter(|c| c.path == "config/").count(), 2);
+
+        let fake = Fake::new(live(), tools::MAX_ATTEMPTS);
+        fake.serve(|| {
+            let e = block(tools::reload(&c(), false)).unwrap_err();
+            assert!(api::is_conflict(&e), "{e:#}");
+        });
+    }
+
+    #[test]
+    fn writes_without_an_etag_are_refused() {
+        let calls = serve(
+            |m, p| (m == "GET" && p == "config/").then(|| (200, vec![], live().to_string())),
+            || {
+                let e = block(tools::set_route(&c(), &set_args(), false))
+                    .unwrap_err()
+                    .to_string();
+                assert!(e.contains("no Etag"), "{e}");
+                let e = block(tools::reload(&c(), false)).unwrap_err().to_string();
+                assert!(e.contains("no Etag"), "{e}");
+                assert!(block(tools::set_route(&c(), &set_args(), true)).is_ok());
+            },
+        );
+        assert!(calls.iter().all(|c| c.method == "GET"), "{calls:?}");
     }
 }

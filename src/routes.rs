@@ -3,6 +3,7 @@
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::serde_json::{Map, Value};
 
+use crate::redact::strip_userinfo;
 use crate::tls::{host_matches, Change};
 
 #[orca_struct]
@@ -103,7 +104,7 @@ fn dials_of(h: &Value) -> Vec<String> {
         .into_iter()
         .flatten()
         .filter_map(|u| u.get("dial").and_then(Value::as_str))
-        .map(str::to_string)
+        .map(|d| strip_userinfo(d).unwrap_or_else(|| d.to_string()))
         .collect()
 }
 
@@ -691,6 +692,17 @@ mod tests {
         assert_eq!(
             routes(&cfg)[0]["match"],
             json!([{ "host": ["c.example.com"] }])
+        );
+    }
+
+    #[test]
+    fn listed_dials_never_show_userinfo() {
+        let mut cfg = sample();
+        cfg["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0]["upstreams"] =
+            json!([{ "dial": "user:pw@10.0.0.5:8080" }]);
+        assert_eq!(
+            list_routes(&cfg)[0].upstreams,
+            vec!["<redacted>@10.0.0.5:8080"]
         );
     }
 }

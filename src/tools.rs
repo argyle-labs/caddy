@@ -190,6 +190,7 @@ pub async fn commit<T>(
         if dry_run || cfg == snap.config {
             return Ok(planned);
         }
+        let etag = require_etag(&snap)?;
         let empty = plugin_toolkit::serde_json::Map::new();
         let before = snap.config.as_object().unwrap_or(&empty);
         let after = cfg.as_object().unwrap_or(&empty);
@@ -208,9 +209,9 @@ pub async fn commit<T>(
             bail!("refusing to remove top-level config key {key}");
         };
         let res = if before.contains_key(*key) {
-            c.patch(key, value, snap.etag.as_deref()).await
+            c.patch(key, value, Some(etag)).await
         } else {
-            c.put(key, value, snap.etag.as_deref()).await
+            c.put(key, value, Some(etag)).await
         };
         match res {
             Ok(()) => return Ok(planned),
@@ -218,6 +219,15 @@ pub async fn commit<T>(
             Err(e) => return Err(e),
         }
     }
+}
+
+pub fn require_etag(snap: &crate::api::Snapshot) -> Result<&str> {
+    snap.etag.as_deref().ok_or_else(|| {
+        anyhow!(
+            "GET /config/ returned no Etag; refusing to write without If-Match, since a \
+             concurrent change could be silently overwritten"
+        )
+    })
 }
 
 fn admin_listen(config: &Value) -> String {
@@ -234,10 +244,19 @@ fn split_addr(addr: &str) -> Option<(String, String)> {
         .trim_start_matches('[')
         .trim_end_matches(']')
         .to_ascii_lowercase();
-    let host = match host.as_str() {
-        "localhost" | "127.0.0.1" | "::1" => "loopback".to_string(),
-        "" | "0.0.0.0" | "::" => "*".to_string(),
-        _ => host,
+    let ip = host.parse::<std::net::IpAddr>().ok().map(|ip| match ip {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
+        v4 => v4,
+    });
+    let host = match ip {
+        _ if host.is_empty() => "*".to_string(),
+        Some(ip) if ip.is_unspecified() => "*".to_string(),
+        Some(ip) if ip.is_loopback() => "loopback".to_string(),
+        Some(ip) => ip.to_string(),
+        None if host == "localhost" => "loopback".to_string(),
+        None => host,
     };
     Some((host, port.to_string()))
 }
@@ -579,19 +598,28 @@ pub struct ReloadReport {
 }
 
 pub async fn reload(c: &Caddy, dry_run: bool) -> Result<ReloadReport> {
-    let snap = c.config().await?;
-    if !dry_run {
-        c.load(&snap.config).await?;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let snap = c.config().await?;
+        if !dry_run {
+            match c.load(&snap.config, Some(require_etag(&snap)?)).await {
+                Ok(()) => {}
+                Err(e) if is_conflict(&e) && attempt < MAX_ATTEMPTS => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        return Ok(ReloadReport {
+            dry_run,
+            reloaded: !dry_run,
+            status: status(c, &snap.config).await,
+        });
     }
-    Ok(ReloadReport {
-        dry_run,
-        reloaded: !dry_run,
-        status: status(c, &snap.config).await,
-    })
 }
 
 /// Reload the running config unchanged (`GET /config/`, then `POST /load` with
-/// `Cache-Control: must-revalidate`). `dryRun` only reads.
+/// `Cache-Control: must-revalidate` and `If-Match`, re-read on HTTP 412 up to
+/// three times). `dryRun` only reads.
 #[orca_tool(
     domain = "caddy",
     verb = "reload",
@@ -703,6 +731,10 @@ mod tests {
     fn admin_address_matching() {
         assert!(same_addr("127.0.0.1:2019", "localhost:2019"));
         assert!(same_addr("[::1]:2019", "localhost:2019"));
+        assert!(same_addr("127.0.0.2:2019", "localhost:2019"));
+        assert!(same_addr("127.255.0.1:2019", "127.0.0.1:2019"));
+        assert!(same_addr("[::ffff:127.0.0.1]:2019", "localhost:2019"));
+        assert!(same_addr("10.0.0.16:2019", "[::ffff:0.0.0.0]:2019"));
         assert!(same_addr("10.0.0.16:2019", "0.0.0.0:2019"));
         assert!(same_addr("10.0.0.16:2019", ":2019"));
         assert!(!same_addr("10.0.0.16:2019", "localhost:2019"));

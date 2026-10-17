@@ -112,7 +112,7 @@ impl Caddy {
         Ok(Snapshot { config, etag })
     }
 
-    pub async fn load(&self, config: &Value) -> Result<()> {
+    pub async fn load(&self, config: &Value, etag: Option<&str>) -> Result<()> {
         let req = self
             .http
             .post(self.url("load"))
@@ -121,6 +121,7 @@ impl Caddy {
                 plugin_toolkit::reqwest::header::HeaderValue::from_static("must-revalidate"),
             )
             .json(config);
+        let req = Self::if_match(req, etag)?;
         self.send(req, "POST /load").await.map(drop)
     }
 
