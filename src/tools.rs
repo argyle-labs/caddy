@@ -1,9 +1,12 @@
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::secrets::{self, MissingSecret, Secret};
 
-use crate::api::{check_dial, check_host, check_segment, Caddy};
+use plugin_toolkit::serde_json::Value;
+
+use crate::api::{check_dial, check_host, check_segment, Caddy, Snapshot};
 use crate::endpoint_db;
 use crate::routes::{self, ProxyRoute};
+use crate::tls::{self, TlsReport};
 
 pub const PROVIDER: &str = "caddy";
 
@@ -38,7 +41,7 @@ pub struct Status {
     pub upstreams: Option<usize>,
 }
 
-async fn status(c: &Caddy, config: &plugin_toolkit::serde_json::Value) -> Status {
+async fn status(c: &Caddy, config: &Value) -> Status {
     Status {
         servers: routes::server_names(config),
         routes: routes::list_routes(config).len(),
@@ -107,7 +110,38 @@ pub struct RouteSetArgs {
     pub server: Option<String>,
 }
 
-pub async fn set_route(c: &Caddy, args: &RouteSetArgs) -> Result<ProxyRoute> {
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteSetReport {
+    pub route: ProxyRoute,
+    pub changed: bool,
+    pub tls: TlsReport,
+}
+
+pub async fn ensure_tls(c: &Caddy, host: &str) -> Result<TlsReport> {
+    check_host(host)?;
+    let snap = c.config().await?;
+    let plan = tls::plan(&snap.config, host);
+    if let Some((path, value)) = &plan.write {
+        c.patch(path, value, snap.etag.as_deref()).await?;
+    }
+    Ok(plan.report)
+}
+
+async fn write_routes(c: &Caddy, snap: &Snapshot, server: &str, routes: &Value) -> Result<()> {
+    let path = format!("apps/http/servers/{server}/routes");
+    if snap
+        .config
+        .pointer(&format!("/apps/http/servers/{server}/routes"))
+        .is_some()
+    {
+        c.patch(&path, routes, snap.etag.as_deref()).await
+    } else {
+        c.put(&path, routes, snap.etag.as_deref()).await
+    }
+}
+
+pub async fn set_route(c: &Caddy, args: &RouteSetArgs) -> Result<RouteSetReport> {
     check_host(&args.host)?;
     let upstreams: Vec<String> = args.upstream.iter().map(|u| u.trim().to_string()).collect();
     if upstreams.is_empty() {
@@ -116,34 +150,122 @@ pub async fn set_route(c: &Caddy, args: &RouteSetArgs) -> Result<ProxyRoute> {
     for u in &upstreams {
         check_dial(u)?;
     }
+    let tls = ensure_tls(c, &args.host).await?;
     let snap = c.config().await?;
     let server = routes::choose_server(&snap.config, args.server.as_deref())?;
     check_segment("server", &server)?;
-    let new = routes::upsert_route(&snap.config, &server, &args.host, &upstreams);
-    c.patch(
-        &format!("apps/http/servers/{server}/routes"),
-        &new,
-        snap.etag.as_deref(),
-    )
-    .await?;
-    Ok(ProxyRoute {
-        server,
-        hosts: vec![args.host.clone()],
-        upstreams,
+    let current = snap
+        .config
+        .pointer(&format!("/apps/http/servers/{server}/routes"))
+        .cloned()
+        .unwrap_or_else(|| Value::Array(vec![]));
+    let new = routes::upsert_route(&snap.config, &server, &args.host, &upstreams)?;
+    let changed = new != current;
+    if changed {
+        write_routes(c, &snap, &server, &new).await?;
+    }
+    Ok(RouteSetReport {
+        route: ProxyRoute {
+            server,
+            hosts: vec![args.host.clone()],
+            upstreams,
+        },
+        changed,
+        tls,
     })
 }
 
-/// Point a host at upstreams. An existing reverse-proxy route for the host has
-/// its upstreams replaced; otherwise a route is appended
-/// (`PATCH /config/apps/http/servers/<server>/routes`, `If-Match`).
+/// Point a host at upstreams and make sure Caddy will issue its certificate.
+/// TLS first: a host covered by no automation policy is added to the subjects
+/// of the closest DNS-01 policy. Then an existing reverse-proxy route for the
+/// host (including a Caddyfile-style subroute) has its upstreams replaced, or a
+/// new route is inserted ahead of any wildcard or catch-all route that would
+/// shadow it. No-op when nothing changes. Writes use
+/// `PATCH /config/apps/tls/automation/policies/<i>/subjects` and
+/// `PATCH /config/apps/http/servers/<server>/routes`, each with `If-Match`.
 #[orca_tool(
     domain = "caddy",
     verb = "route.set",
     role = "admin",
     execute_gated = true
 )]
-async fn caddy_route_set(args: RouteSetArgs, _ctx: &ToolCtx) -> Result<ProxyRoute> {
+async fn caddy_route_set(args: RouteSetArgs, _ctx: &ToolCtx) -> Result<RouteSetReport> {
     set_route(&connect(&args.name).await?, &args).await
+}
+
+#[orca_struct(args)]
+pub struct TlsEnsureArgs {
+    /// Registered caddy endpoint name.
+    #[arg(long)]
+    pub name: String,
+    /// Hostname that needs a certificate.
+    #[arg(long)]
+    pub host: String,
+}
+
+/// Make sure Caddy's TLS automation covers a host: a catch-all policy or a
+/// matching subject (exact or one-label wildcard) leaves it alone; otherwise
+/// the host joins the subjects of the closest DNS-01 policy
+/// (`PATCH /config/apps/tls/automation/policies/<i>/subjects`, `If-Match`).
+/// Without a DNS-01 policy nothing is written and Caddy's default issuers apply.
+#[orca_tool(
+    domain = "caddy",
+    verb = "tls.ensure",
+    role = "admin",
+    execute_gated = true
+)]
+async fn caddy_tls_ensure(args: TlsEnsureArgs, _ctx: &ToolCtx) -> Result<TlsReport> {
+    ensure_tls(&connect(&args.name).await?, &args.host).await
+}
+
+/// The full running config, unredacted, for persisting as the instance's JSON
+/// config (`GET /config/`). May contain credentials, so admin only.
+#[orca_tool(
+    domain = "caddy",
+    verb = "config.export",
+    role = "admin",
+    execute_gated = false
+)]
+async fn caddy_config_export(args: EndpointArgs, _ctx: &ToolCtx) -> Result<JsonAny> {
+    Ok(JsonAny(connect(&args.name).await?.config().await?.config))
+}
+
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistReport {
+    pub persist: bool,
+    pub changed: bool,
+}
+
+pub async fn persist(c: &Caddy) -> Result<PersistReport> {
+    let snap = c.config().await?;
+    let off = snap.config.pointer("/admin/config/persist") == Some(&Value::Bool(false));
+    if off {
+        c.patch(
+            "admin/config/persist",
+            &Value::Bool(true),
+            snap.etag.as_deref(),
+        )
+        .await?;
+    }
+    Ok(PersistReport {
+        persist: true,
+        changed: off,
+    })
+}
+
+/// Make sure Caddy autosaves every admin-API change to `autosave.json`
+/// (`admin.config.persist`, default true). Only an explicit `false` is
+/// rewritten (`PATCH /config/admin/config/persist`). Run Caddy with
+/// `caddy run --resume` so the autosave is what it starts from.
+#[orca_tool(
+    domain = "caddy",
+    verb = "config.persist",
+    role = "admin",
+    execute_gated = true
+)]
+async fn caddy_config_persist(args: EndpointArgs, _ctx: &ToolCtx) -> Result<PersistReport> {
+    persist(&connect(&args.name).await?).await
 }
 
 #[orca_struct(args)]
@@ -171,12 +293,7 @@ pub async fn delete_route(c: &Caddy, args: &RouteDeleteArgs) -> Result<ProxyRout
             args.host
         );
     }
-    c.patch(
-        &format!("apps/http/servers/{server}/routes"),
-        &new,
-        snap.etag.as_deref(),
-    )
-    .await?;
+    write_routes(c, &snap, &server, &new).await?;
     Ok(ProxyRoute {
         server,
         hosts: vec![args.host.clone()],
@@ -184,7 +301,8 @@ pub async fn delete_route(c: &Caddy, args: &RouteDeleteArgs) -> Result<ProxyRout
     })
 }
 
-/// Remove the reverse-proxy route for a host
+/// Remove the reverse-proxy route for a host. A route shared with other hosts
+/// keeps serving them and only drops this host from its matcher
 /// (`PATCH /config/apps/http/servers/<server>/routes`, `If-Match`).
 #[orca_tool(
     domain = "caddy",
@@ -212,11 +330,20 @@ mod tests {
     #[test]
     fn tools_declare_roles_and_gating() {
         let role = |n| plugin_toolkit::dispatch::required_role(n);
+        let gated = plugin_toolkit::dispatch::execute_gated_names();
         for n in ["caddy.status", "caddy.config.get", "caddy.route.list"] {
             assert_eq!(role(n), Some("read"), "{n}");
+            assert!(!gated.contains(&n), "{n}");
         }
-        let gated = plugin_toolkit::dispatch::execute_gated_names();
-        for n in ["caddy.reload", "caddy.route.set", "caddy.route.delete"] {
+        assert_eq!(role("caddy.config.export"), Some("admin"));
+        assert!(!gated.contains(&"caddy.config.export"));
+        for n in [
+            "caddy.reload",
+            "caddy.route.set",
+            "caddy.route.delete",
+            "caddy.tls.ensure",
+            "caddy.config.persist",
+        ] {
             assert_eq!(role(n), Some("admin"), "{n}");
             assert!(gated.contains(&n), "{n}");
         }

@@ -108,6 +108,12 @@ impl Caddy {
         self.send(req, &op).await.map(drop)
     }
 
+    pub async fn put(&self, path: &str, value: &Value, etag: Option<&str>) -> Result<()> {
+        let op = format!("PUT /config/{path}");
+        let req = Self::if_match(self.http.put(self.config_url(path)).json(value), etag)?;
+        self.send(req, &op).await.map(drop)
+    }
+
     pub async fn upstream_count(&self) -> Result<usize> {
         let (_, body) = self
             .send(

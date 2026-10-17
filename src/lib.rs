@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod routes;
+pub mod tls;
 pub mod tools;
 
 use plugin_toolkit::clap;
@@ -92,6 +93,8 @@ mod tests {
 
     const KEY: &str = "caddykey-0123456789abcdef";
 
+    type Reply = Option<(u16, Vec<(String, String)>, String)>;
+
     #[derive(Debug, Clone)]
     struct Call {
         method: String,
@@ -100,10 +103,7 @@ mod tests {
         body: Value,
     }
 
-    fn serve<F>(
-        route: impl Fn(&str, &str) -> Option<(u16, Vec<(String, String)>, String)> + 'static,
-        body: F,
-    ) -> Vec<Call>
+    fn serve<F>(route: impl Fn(&str, &str) -> Reply + 'static, body: F) -> Vec<Call>
     where
         F: FnOnce(),
     {
@@ -271,7 +271,7 @@ mod tests {
     }
 
     fn serve_err(
-        route: impl Fn(&str, &str) -> Option<(u16, Vec<(String, String)>, String)> + 'static,
+        route: impl Fn(&str, &str) -> Reply + 'static,
         f: impl FnOnce(api::Caddy) -> plugin_toolkit::anyhow::Error,
     ) -> String {
         let mut out = String::new();
@@ -369,6 +369,14 @@ mod tests {
                         "caddy.route.delete",
                         json!({"name": "edge", "host": "a.example.com", "dryRun": true}),
                     ),
+                    (
+                        "caddy.tls.ensure",
+                        json!({"name": "edge", "host": "a.example.com", "dryRun": true}),
+                    ),
+                    (
+                        "caddy.config.persist",
+                        json!({"name": "edge", "dryRun": true}),
+                    ),
                 ] {
                     let out = block(plugin_toolkit::dispatch::dispatch(tool, args, &ctx))
                         .unwrap_or_else(|e| panic!("{tool}: {e:#}"));
@@ -381,5 +389,179 @@ mod tests {
             "{:?}",
             caps.lock().unwrap()
         );
+    }
+
+    fn live() -> Value {
+        json!({
+            "apps": {
+                "http": { "servers": { "srv0": { "listen": [":443"], "routes": [
+                    {
+                        "match": [{ "host": ["gitea.scottkey.me"] }],
+                        "handle": [{ "handler": "subroute", "routes": [
+                            { "handle": [{ "handler": "reverse_proxy",
+                                           "upstreams": [{ "dial": "10.0.0.20:3000" }] }] }
+                        ]}],
+                        "terminal": true
+                    }
+                ]}}},
+                "tls": { "automation": { "policies": [
+                    { "subjects": ["gitea.scottkey.me"],
+                      "issuers": [{ "module": "acme", "challenges": { "dns": { "provider":
+                          { "name": "cloudflare", "api_token": "cf-literal-token" } } } }] }
+                ]}}
+            }
+        })
+    }
+
+    fn stateful(initial: Value) -> (Arc<Mutex<Value>>, impl Fn(&str, &str) -> Reply + 'static) {
+        let state = Arc::new(Mutex::new(initial));
+        let s = state.clone();
+        let route = move |method: &str, path: &str| {
+            let cfg = s.lock().unwrap().clone();
+            match (method, path) {
+                ("GET", "config/") => {
+                    let tag = format!("\"/config/ {:x}\"", cfg.to_string().len());
+                    Some((200, etag(&tag), cfg.to_string()))
+                }
+                ("PATCH", _) | ("PUT", _) => Some((200, vec![], String::new())),
+                _ => None,
+            }
+        };
+        (state, route)
+    }
+
+    fn apply(state: &Arc<Mutex<Value>>, calls: &[Call]) {
+        let mut cfg = state.lock().unwrap();
+        for call in calls.iter().filter(|c| c.method != "GET") {
+            let ptr = format!("/{}", call.path.trim_start_matches("config/"));
+            *cfg.pointer_mut(&ptr).unwrap() = call.body.clone();
+        }
+    }
+
+    fn set_args() -> tools::RouteSetArgs {
+        tools::RouteSetArgs {
+            name: "edge".into(),
+            host: "orca.scottkey.me".into(),
+            upstream: vec!["10.0.0.6:12000".into()],
+            server: None,
+        }
+    }
+
+    #[test]
+    fn route_set_adds_the_tls_subject_then_the_route() {
+        let (state, route) = stateful(live());
+        let mut out = None;
+        let calls = serve(route, || {
+            out = Some(block(tools::set_route(&c(), &set_args())).unwrap())
+        });
+        let out = out.unwrap();
+        assert!(out.changed);
+        assert_eq!(out.tls.action, tls::TlsAction::SubjectAdded);
+        let writes: Vec<&Call> = calls.iter().filter(|c| c.method != "GET").collect();
+        assert_eq!(writes.len(), 2, "{calls:?}");
+        assert_eq!(writes[0].method, "PATCH");
+        assert_eq!(
+            writes[0].path,
+            "config/apps/tls/automation/policies/0/subjects"
+        );
+        assert_eq!(
+            writes[0].body,
+            json!(["gitea.scottkey.me", "orca.scottkey.me"])
+        );
+        assert_eq!(writes[1].path, "config/apps/http/servers/srv0/routes");
+        assert_eq!(
+            writes[1].body[1]["match"],
+            json!([{ "host": ["orca.scottkey.me"] }])
+        );
+        assert_eq!(
+            writes[1].body[1]["handle"][0]["upstreams"],
+            json!([{ "dial": "10.0.0.6:12000" }])
+        );
+        for w in writes {
+            assert!(w.headers.contains("if-match"), "{}", w.headers);
+        }
+        apply(&state, &calls);
+        let calls = serve(stateful(state.lock().unwrap().clone()).1, || {
+            let again = block(tools::set_route(&c(), &set_args())).unwrap();
+            assert!(!again.changed);
+            assert_eq!(again.tls.action, tls::TlsAction::Covered);
+        });
+        assert!(calls.iter().all(|c| c.method == "GET"), "{calls:?}");
+    }
+
+    #[test]
+    fn route_set_creates_a_missing_routes_array() {
+        let mut cfg = live();
+        cfg["apps"]["http"]["servers"]["srv0"]
+            .as_object_mut()
+            .unwrap()
+            .remove("routes");
+        let (_, route) = stateful(cfg);
+        let calls = serve(route, || {
+            block(tools::set_route(&c(), &set_args())).unwrap();
+        });
+        let last = calls.last().unwrap();
+        assert_eq!(last.method, "PUT");
+        assert_eq!(last.path, "config/apps/http/servers/srv0/routes");
+    }
+
+    #[test]
+    fn route_set_rejects_bad_input_before_any_request() {
+        let calls = serve(
+            |_, _| None,
+            || {
+                let mut a = set_args();
+                a.upstream = vec!["10.0.0.6".into()];
+                assert!(block(tools::set_route(&c(), &a)).is_err());
+                let mut a = set_args();
+                a.host = "orca.scottkey.me/x".into();
+                assert!(block(tools::set_route(&c(), &a)).is_err());
+            },
+        );
+        assert!(calls.is_empty(), "{calls:?}");
+    }
+
+    #[test]
+    fn route_delete_writes_the_trimmed_routes() {
+        let (_, route) = stateful(live());
+        let calls = serve(route, || {
+            let args = tools::RouteDeleteArgs {
+                name: "edge".into(),
+                host: "gitea.scottkey.me".into(),
+                server: None,
+            };
+            block(tools::delete_route(&c(), &args)).unwrap();
+        });
+        let last = calls.last().unwrap();
+        assert_eq!(last.method, "PATCH");
+        assert_eq!(last.body, json!([]));
+    }
+
+    #[test]
+    fn persist_only_rewrites_an_explicit_false() {
+        let (_, route) = stateful(live());
+        let calls = serve(route, || {
+            assert!(!block(tools::persist(&c())).unwrap().changed);
+        });
+        assert!(calls.iter().all(|c| c.method == "GET"));
+        let mut cfg = live();
+        cfg["admin"] = json!({"config": {"persist": false}});
+        let (_, route) = stateful(cfg);
+        let calls = serve(route, || {
+            assert!(block(tools::persist(&c())).unwrap().changed);
+        });
+        let last = calls.last().unwrap();
+        assert_eq!(last.path, "config/admin/config/persist");
+        assert_eq!(last.body, json!(true));
+    }
+
+    #[test]
+    fn config_redaction_hides_dns_tokens_and_reads_are_lossless() {
+        let redacted = plugin_toolkit::scrub::redact_json(live());
+        assert!(!redacted.to_string().contains("cf-literal-token"));
+        let (_, route) = stateful(live());
+        serve(route, || {
+            assert_eq!(block(c().config()).unwrap().config, live());
+        });
     }
 }
